@@ -1,0 +1,47 @@
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;800;900&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --color-safe: #22c55e;
+  --color-low: #06b6d4;
+  --color-medium: #7c3aed;
+  --color-high: #f59e0b;
+  --color-critical: #ef4444;
+
+  --font-orbitron: 'Orbitron', monospace;
+  --font-jetbrains: 'JetBrains Mono', monospace;
+  --font-inter: 'Inter', sans-serif;
+}
+
+@layer base {
+  body {
+    background-color: #080514;
+    overflow-x: hidden;
+    color: #f1f5f9;
+    font-family: var(--font-inter);
+    margin: 0;
+  }
+}
+
+/* Transparent Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px; /* Set a width for the scrollbar to take up space */
+}
+
+::-webkit-scrollbar-track {
+  background: transparent; /* Make the track invisible */
+}
+
+::-webkit-scrollbar-thumb {
+  background: transparent; /* Make the draggable part invisible */
+}
+
+/* Base utility for hiding scrollbars completely if needed somewhere else */
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
