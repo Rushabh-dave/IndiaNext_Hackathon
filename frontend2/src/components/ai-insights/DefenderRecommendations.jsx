@@ -17,12 +17,12 @@ export default function DefenderRecommendations() {
 
       <div className="space-y-4">
         {recommendations.map((rec, idx) => (
-           <div key={idx} className="flex gap-4 items-start bg-black/30 border border-white/5 p-4 rounded-lg">
-              <rec.icon className={`w-5 h-5 mt-0.5 flex-shrink-0 ${rec.color}`} />
-              <p className="font-inter text-slate-300 text-[14px] leading-relaxed">
-                {rec.text}
-              </p>
-           </div>
+          <div key={idx} className="flex gap-4 items-start bg-black/30 border border-white/5 p-4 rounded-lg">
+            <rec.icon className={`w-5 h-5 mt-0.5 flex-shrink-0 ${rec.color}`} />
+            <p className="font-inter text-slate-300 text-[14px] leading-relaxed">
+              {rec.text}
+            </p>
+          </div>
         ))}
       </div>
     </div>

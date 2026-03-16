@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageSquareWarning } from 'lucide-react';
 import DetectionCard from '../DetectionCard';
-import { apiService } from '../../../services/apiService';
+import { apiService, normalizeResult } from '../../../services/apiService';
 
 export default function MessageScanner() {
   const [message, setMessage] = useState('');
@@ -12,16 +12,19 @@ export default function MessageScanner() {
 
   const handleAnalyze = async () => {
     setError('');
-    if (!message) {
-      setError('This field is necessary. Please enter a message.');
+    if (!message.trim()) {
+      setError('This field is required. Please enter a message.');
       return;
     }
     setIsAnalyzing(true);
     try {
-      const res = await apiService.scanMessage(message);
-      navigate('/dashboard', { state: { result: res, type: 'Message', input: message } });
+      // Messages go through the phishing model (body-only mode)
+      const raw = await apiService.analyzePhishing({ body: message });
+      const result = normalizeResult(raw, 'Message');
+      navigate('/dashboard', { state: { result, type: 'Malicious Message', input: message.slice(0, 80) } });
     } catch (err) {
-      navigate('/dashboard', { state: { result: { error: 'Failed to connect' }, type: 'Message', input: message } });
+      const errMsg = err?.response?.data?.detail || err.message || 'Connection failed';
+      setError(`Analysis failed: ${errMsg}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -31,7 +34,7 @@ export default function MessageScanner() {
     <DetectionCard
       title="Malicious Message Detection"
       icon={<MessageSquareWarning size={24} />}
-      color="#f59e0b" // Orange
+      color="#f59e0b"
       onAnalyze={handleAnalyze}
       isAnalyzing={isAnalyzing}
       actionText="ANALYZE MESSAGE"
@@ -44,7 +47,7 @@ export default function MessageScanner() {
           rows={6}
           className="w-full bg-[#080514] border border-white/10 rounded-xl py-4 px-5 text-slate-200 font-jetbrains text-[14px] outline-none focus:border-[#f59e0b]/50 transition-colors resize-none"
         />
-        {error && <div className="text-red-500 font-jetbrains text-[12px] animate-pulse">{error}</div>}
+        {error && <div className="text-red-400 font-jetbrains text-[12px] animate-pulse">{error}</div>}
       </div>
     </DetectionCard>
   );

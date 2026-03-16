@@ -2,7 +2,7 @@ import { useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Image as ImageIcon, UploadCloud } from 'lucide-react';
 import DetectionCard from '../DetectionCard';
-import { apiService } from '../../../services/apiService';
+import { apiService, normalizeResult } from '../../../services/apiService';
 
 export default function ImageScanner() {
   const [file, setFile] = useState(null);
@@ -13,23 +13,20 @@ export default function ImageScanner() {
 
   const handleFileChange = (e) => {
     setError('');
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
-    }
+    if (e.target.files?.[0]) setFile(e.target.files[0]);
   };
 
   const handleAnalyze = async () => {
     setError('');
-    if (!file) {
-      setError('This field is necessary. Please select an image.');
-      return;
-    }
+    if (!file) { setError('Please select an image file.'); return; }
     setIsAnalyzing(true);
     try {
-      const res = await apiService.scanImage(file);
-      navigate('/dashboard', { state: { result: res, type: 'Image', input: file.name } });
+      const raw = await apiService.analyzeDeepfakeImage(file);
+      const result = normalizeResult(raw, 'Image');
+      navigate('/dashboard', { state: { result, type: 'Deepfake Image', input: file.name } });
     } catch (err) {
-      navigate('/dashboard', { state: { result: { error: 'Failed' }, type: 'Image', input: file.name } });
+      const errMsg = err?.response?.data?.detail || err.message || 'Connection failed';
+      setError(`Analysis failed: ${errMsg}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -39,7 +36,7 @@ export default function ImageScanner() {
     <DetectionCard
       title="Fake Image Detection"
       icon={<ImageIcon size={24} />}
-      color="#ec4899" // Pink
+      color="#ec4899"
       onAnalyze={handleAnalyze}
       isAnalyzing={isAnalyzing}
       actionText="ANALYZE IMAGE"
@@ -49,13 +46,7 @@ export default function ImageScanner() {
         style={{ borderColor: file ? '#ec4899' : 'rgba(255,255,255,0.1)' }}
         onClick={() => fileInputRef.current?.click()}
       >
-        <input
-          type="file"
-          ref={fileInputRef}
-          className="hidden"
-          accept="image/*"
-          onChange={handleFileChange}
-        />
+        <input type="file" ref={fileInputRef} className="hidden" accept=".jpg,.jpeg,.png,.webp,.bmp" onChange={handleFileChange} />
         {file ? (
           <div className="text-center">
             <div className="w-12 h-12 rounded-lg bg-[#ec4899]/20 flex items-center justify-center mx-auto mb-3">
@@ -68,11 +59,11 @@ export default function ImageScanner() {
           <div className="text-center group-hover:scale-105 transition-transform">
             <UploadCloud className="w-10 h-10 text-slate-500 mx-auto mb-3" />
             <p className="font-orbitron text-[14px] text-slate-300 font-bold tracking-widest uppercase">Select Image to Scan</p>
-            <p className="font-jetbrains text-[11px] text-slate-500 mt-2">JPG, PNG, WEBP up to 10MB</p>
+            <p className="font-jetbrains text-[11px] text-slate-500 mt-2">JPG, PNG, WEBP, BMP up to 10MB</p>
           </div>
         )}
       </div>
-      {error && <div className="text-red-500 font-jetbrains text-[12px] mt-3 animate-pulse text-center w-full">{error}</div>}
+      {error && <div className="text-red-400 font-jetbrains text-[12px] mt-3 animate-pulse text-center">{error}</div>}
     </DetectionCard>
   );
 }

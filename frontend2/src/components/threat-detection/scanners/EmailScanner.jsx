@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Mail } from 'lucide-react';
 import DetectionCard from '../DetectionCard';
-import { apiService } from '../../../services/apiService';
+import { apiService, normalizeResult } from '../../../services/apiService';
 
 export default function EmailScanner() {
   const [sender, setSender] = useState('');
@@ -12,18 +12,15 @@ export default function EmailScanner() {
   const [error, setError] = useState('');
   const navigate = useNavigate();
 
-  const validateEmail = (email) => {
-    return String(email)
-      .toLowerCase()
-      .match(
-        /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|.(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
-      );
-  };
+  const validateEmail = (email) =>
+    String(email).toLowerCase().match(
+      /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
+    );
 
   const handleAnalyze = async () => {
     setError('');
-    if (!sender || !subject || !content) {
-      setError('All fields are necessary. Please enter sender, subject, and content.');
+    if (!content.trim()) {
+      setError('Email body is required.');
       return;
     }
     if (sender && !validateEmail(sender)) {
@@ -33,10 +30,18 @@ export default function EmailScanner() {
 
     setIsAnalyzing(true);
     try {
-      const res = await apiService.scanEmail({ sender, subject, content });
-      navigate('/dashboard', { state: { result: res, type: 'Email', input: subject || sender } });
+      const raw = await apiService.analyzePhishing({
+        body: content,
+        sender: sender || undefined,
+        subject: subject || undefined,
+      });
+      const result = normalizeResult(raw, 'Email');
+      navigate('/dashboard', {
+        state: { result, type: 'Phishing Email', input: subject || sender || '(no subject)', scanType: 'email' },
+      });
     } catch (err) {
-      navigate('/dashboard', { state: { result: { error: 'Failed' }, type: 'Email', input: subject || sender } });
+      const errMsg = err?.response?.data?.detail || err.message || 'Connection failed';
+      setError(`Analysis failed: ${errMsg}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -46,7 +51,7 @@ export default function EmailScanner() {
     <DetectionCard
       title="Phishing Email Detection"
       icon={<Mail size={24} />}
-      color="#3b82f6" // Blue
+      color="#3b82f6"
       onAnalyze={handleAnalyze}
       isAnalyzing={isAnalyzing}
       actionText="ANALYZE EMAIL"
@@ -73,7 +78,7 @@ export default function EmailScanner() {
           rows={6}
           className="w-full bg-[#080514] border border-white/10 rounded-xl py-4 px-5 text-slate-200 font-jetbrains text-[13px] outline-none focus:border-[#3b82f6]/50 transition-colors resize-none"
         />
-        {error && <div className="text-red-500 font-jetbrains text-[12px] mt-2 animate-pulse">{error}</div>}
+        {error && <div className="text-red-400 font-jetbrains text-[12px] mt-2 animate-pulse">{error}</div>}
       </div>
     </DetectionCard>
   );

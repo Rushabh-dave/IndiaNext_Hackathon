@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bot, Terminal } from 'lucide-react';
 import DetectionCard from '../DetectionCard';
-import { apiService } from '../../../services/apiService';
+import { apiService, normalizeResult } from '../../../services/apiService';
 
 export default function PromptScanner() {
   const [prompt, setPrompt] = useState('');
@@ -12,16 +12,18 @@ export default function PromptScanner() {
 
   const handleAnalyze = async () => {
     setError('');
-    if (!prompt) {
-      setError('This field is necessary. Please enter a prompt.');
+    if (!prompt.trim()) {
+      setError('Please enter a prompt to analyze.');
       return;
     }
     setIsAnalyzing(true);
     try {
-      const res = await apiService.scanPrompt(prompt);
-      navigate('/dashboard', { state: { result: res, type: 'Prompt Injection', input: prompt } });
+      const raw = await apiService.analyzePromptInjection(prompt.trim());
+      const result = normalizeResult(raw, 'Prompt Injection');
+      navigate('/dashboard', { state: { result, type: 'Prompt Injection', input: prompt.slice(0, 80) } });
     } catch (err) {
-      navigate('/dashboard', { state: { result: { error: 'Failed' }, type: 'Prompt Injection', input: prompt } });
+      const errMsg = err?.response?.data?.detail || err.message || 'Connection failed';
+      setError(`Analysis failed: ${errMsg}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -31,7 +33,7 @@ export default function PromptScanner() {
     <DetectionCard
       title="Prompt Injection Detection"
       icon={<Bot size={24} />}
-      color="#d946ef" // Fuchsia
+      color="#d946ef"
       onAnalyze={handleAnalyze}
       isAnalyzing={isAnalyzing}
       actionText="CHECK PROMPT"
@@ -47,7 +49,7 @@ export default function PromptScanner() {
           rows={5}
           className="w-full bg-[#080514] border border-white/10 rounded-xl py-5 pl-12 pr-5 text-slate-200 font-jetbrains text-[14px] outline-none focus:border-[#d946ef]/50 transition-colors resize-none"
         />
-        {error && <div className="text-red-500 font-jetbrains text-[12px] mt-2 animate-pulse">{error}</div>}
+        {error && <div className="text-red-400 font-jetbrains text-[12px] mt-2 animate-pulse">{error}</div>}
       </div>
     </DetectionCard>
   );

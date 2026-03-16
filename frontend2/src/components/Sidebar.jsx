@@ -59,8 +59,8 @@ export default function Sidebar({ currentThreatLevel = 'ELEVATED' }) {
                   key={item.name}
                   to={item.path}
                   className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all font-inter text-[14px] ${isActive
-                      ? 'bg-green-500/10 border border-green-500/30 text-green-400 shadow-[inset_0_0_20px_rgba(34,197,94,0.05)]'
-                      : 'border border-transparent text-slate-400 hover:text-slate-200 hover:bg-white/5'
+                    ? 'bg-green-500/10 border border-green-500/30 text-green-400 shadow-[inset_0_0_20px_rgba(34,197,94,0.05)]'
+                    : 'border border-transparent text-slate-400 hover:text-slate-200 hover:bg-white/5'
                     }`}
                 >
                   <div className="flex items-center gap-3">

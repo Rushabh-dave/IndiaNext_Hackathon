@@ -20,7 +20,8 @@ export default function DetectionCard({
   children, 
   onAnalyze, 
   isAnalyzing, 
-  actionText = "ANALYZE"
+  actionText = "ANALYZE",
+  disabled = false,
 }) {
   const hexToRgb = (hex) => {
     let result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -70,13 +71,14 @@ export default function DetectionCard({
 
         {/* Action Button */}
         <ActionButton
-          onClick={onAnalyze}
-          disabled={isAnalyzing}
+          onClick={disabled ? undefined : onAnalyze}
+          disabled={isAnalyzing || disabled}
           className="w-full mt-auto py-4 rounded-xl text-[14px] gap-3 flex-shrink-0"
           style={{ 
-            backgroundColor: isAnalyzing ? colAlpha(0.2) : colAlpha(0.1), 
-            borderColor: colAlpha(0.4),
-            color: color
+            backgroundColor: (isAnalyzing || disabled) ? colAlpha(0.05) : colAlpha(0.1), 
+            borderColor: colAlpha(disabled ? 0.1 : 0.4),
+            color: disabled ? colAlpha(0.3) : color,
+            cursor: disabled ? 'not-allowed' : undefined,
           }}
         >
           {isAnalyzing ? (
