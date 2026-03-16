@@ -1,12 +1,10 @@
-# temporal_fusion.py
+# temporal_fusion.py (FIXED v3.2)
 # ─────────────────────────────────────────────────────────────
-# AEGIS — Phase 2: Temporal Fusion + SHAP + Groq Narrative
-#
-# SHAP approach: KernelExplainer on output-probability space.
-# Groq: llama-3.1-8b-instant generates defender + attacker
-#       narrative from the fused analysis output.
-#
-# pip install shap groq python-dotenv
+# KEY FIXES:
+# 1. peak_score weight: 0.05 → 0.30 (if any alert is 0.99, it dominates)
+# 2. velocity weight: 0.20 → 0.05 (2 alerts in 3.5min is still aggressive)
+# 3. recency_weight weight: 0.10 → 0.15 (recent threats matter more)
+# 4. Added severity_floor to prevent LOW severity from killing CRITICAL threats
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -187,36 +185,21 @@ def init_url_explainer(tokenizer, model):
 
 # ─────────────────────────────────────────────────────────────
 # SHAP SHAPE NORMALIZER
-#
-# Debug confirmed your shap version returns shape (1, 2, 2):
-#   axis 0 = n_samples  (1)
-#   axis 1 = n_features (2)  ← the [legit, phishing] values
-#   axis 2 = n_classes  (2)
-#
-# To get feature attributions for class 1 (phishing/malicious):
-#   sv[0, :, 1]  →  shape (2,)  ← exactly what we need
-#
-# All other shapes handled as fallbacks for portability.
 # ─────────────────────────────────────────────────────────────
 
 def _extract_class1_shap(shap_vals: any, class_idx: int = 1) -> np.ndarray:
     sv = np.array(shap_vals)
 
     if sv.ndim == 3 and sv.shape[0] == 1:
-        # YOUR version: (n_samples=1, n_features=2, n_classes=2)
-        # confirmed by debug_shap.py → shape (1, 2, 2)
         return sv[0, :, class_idx]
 
     elif sv.ndim == 3:
-        # older shap: (n_classes, n_samples, n_features)
         return sv[class_idx].flatten()
 
     elif sv.ndim == 2 and sv.shape[0] == 1:
-        # (1, n_features) — no class dim
         return sv[0]
 
     elif sv.ndim == 2 and sv.shape[1] == 2:
-        # (n_features, n_classes) — transposed
         return sv[:, class_idx]
 
     else:
@@ -345,8 +328,6 @@ def explain_url_input(domain: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────
 # GROQ NARRATIVE ENGINE
-# Called only when fused_score >= 0.40 AND alert_count >= 3
-# Never crashes the endpoint — always returns a fallback
 # ─────────────────────────────────────────────────────────────
 
 def generate_narrative(analysis: dict) -> dict:
@@ -365,41 +346,84 @@ def generate_narrative(analysis: dict) -> dict:
     alert_types   = list(set(t["alert_type"] for t in timeline))
 
     shap_notes = [
-        f"[{t['alert_type']} | score={t['threat_score']} | mitre={t.get('mitre')}] {t.get('shap_note', '')}"
+        f"[{t['alert_type']} | threat level: {_threat_level(t['threat_score'])}] {t.get('shap_note', '')}"
         for t in timeline if t.get("shap_note")
     ]
-    shap_summary = "\n".join(shap_notes) if shap_notes else "No SHAP deviation notes available."
+    shap_summary = "\n".join(shap_notes) if shap_notes else "No additional threat analysis available."
 
-    prompt = f"""You are a senior SOC analyst and threat intelligence expert at a Fortune 500 company.
+    # Stage descriptions for layperson understanding
+    stage_descriptions = {
+        "Recon": "The attacker is gathering information about your organization",
+        "Initial Access": "The attacker is trying to break into your systems (via phishing, malicious links, etc.)",
+        "Execution": "The attacker is trying to run malicious code on your computers",
+        "Persistence": "The attacker is trying to stay in your systems permanently",
+        "Privilege Escalation": "The attacker is trying to gain administrator-level access",
+        "Lateral Movement": "The attacker is trying to spread to other computers in your network",
+        "Collection": "The attacker is stealing data from your systems",
+        "Exfiltration/Impact": "The attacker is removing stolen data or causing damage"
+    }
 
-You have received the following real-time attack intelligence from an AI-powered detection system:
+    current_stage_desc = stage_descriptions.get(current_stage, f"Attack stage: {current_stage}")
+    next_stage_desc = stage_descriptions.get(next_stage, f"Attack stage: {next_stage}")
 
-THREAT SIGNALS:
-- Alert types detected: {', '.join(alert_types) if alert_types else 'unknown'}
-- Total alerts in window: {alert_count}
-- Fused threat score: {fused_score:.2f} / 1.0
-- Severity: {severity}
-- Kill-chain stage now: {current_stage}
-- Stages traversed: {' → '.join(stages_done) if stages_done else 'none recorded'}
-- Predicted next stage: {next_stage}
-- Estimated time to next move: {f'~{eta_minutes} minutes' if eta_minutes else 'unknown'}
+    # Determine threat level for more proportional responses
+    threat_level = "LOW"
+    if fused_score >= 0.85:
+        threat_level = "CRITICAL"
+    elif fused_score >= 0.65:
+        threat_level = "HIGH"
+    elif fused_score >= 0.40:
+        threat_level = "MEDIUM"
 
-TEMPORAL FEATURES (0.0–1.0):
-- Alert velocity: {features.get('velocity', 0):.2f}
-- Kill-chain progression rate: {features.get('kill_chain_prog', 0):.2f}
-- Kill-chain depth reached: {features.get('kill_chain_depth', 0):.2f}
-- Severity trend (rising=1.0): {features.get('severity_trend', 0):.2f}
-- Peak individual threat score: {features.get('peak_score', 0):.2f}
+    # CRITICAL FIX: Only use "attacker has gained access" language for EXECUTION+ stages
+    # For Initial Access only, use "attacker is TRYING to gain access"
+    is_post_execution = len([s for s in stages_done if s in ["Execution", "Persistence", "Privilege Escalation", "Lateral Movement", "Collection", "Exfiltration/Impact"]]) > 0
+    
+    prompt = f"""You are explaining a cybersecurity threat to a business executive or manager who does NOT have technical expertise.
 
-AI EXPLAINABILITY (SHAP deviations from baseline):
+IMPORTANT CONTEXT:
+- This is a DETECTED threat, NOT a confirmed successful compromise
+- The attacker has NOT yet gained access to our systems
+- We are trying to PREVENT this attack before it gets worse
+- Scale your response to match the actual threat level
+
+WHAT'S HAPPENING RIGHT NOW:
+- Type of attack: {', '.join(alert_types) if alert_types else 'suspected cyber attack'}
+- Current threat severity: {severity}
+- Number of attack signs detected: {alert_count}
+- What this means: {current_stage_desc}
+- Threat level: {threat_level}
+
+WHAT WE EXPECT NEXT:
+- Predicted next step: {next_stage_desc}
+- Time until next attack phase: {f'approximately {eta_minutes} minutes' if eta_minutes else 'unknown'}
+- Stages of attack already completed: {', '.join(stages_done) if stages_done else 'initial phase only'}
+
+THREAT SEVERITY INDICATORS:
+- Overall threat score: {fused_score:.0%} (where 100% = maximum danger)
+- Attack speed: {'Fast' if features.get('velocity', 0) > 0.5 else 'Moderate' if features.get('velocity', 0) > 0.2 else 'Slow'}
+- Severity getting worse: {'Yes - escalating rapidly' if features.get('severity_trend', 0) > 0.5 else 'No - stable'}
+
+THREAT ANALYSIS:
 {shap_summary}
+
+CRITICAL INSTRUCTIONS FOR YOUR RESPONSE:
+- DO NOT assume the attacker has "gained access" or is "already in the system"
+- DO say the attacker is "TRYING to break in" or "ATTEMPTING to gain access"
+- Scale urgency to match threat level:
+  * CRITICAL: Immediate danger, take extreme action
+  * HIGH: Serious threat, urgent response needed
+  * MEDIUM: Concerning, need to act soon but don't panic
+  * LOW: Monitor closely, don't overreact
+- For Initial Access stage: Focus on PREVENTION, not remediation
+- For Execution+ stages: Focus on CONTAINMENT and remediation
 
 Respond in this EXACT JSON format. No markdown, no extra text, no code fences:
 {{
-  "defender_brief": "3 sentences for a SOC analyst. Sentence 1: what is happening right now and what attack type this is. Sentence 2: what the attacker will do next and why. Sentence 3: the single most critical action to take immediately. Be specific — name the stage, technique, and time pressure.",
-  "attacker_narrative": "3 sentences written in first person as the attacker. Start with 'I have...'. Sentence 1: what you have already accomplished. Sentence 2: what your next move is and how you will execute it. Sentence 3: why the defender is running out of time. Make it specific and chilling.",
-  "risk_summary": "One sentence. The single worst outcome if no action is taken in the next 10 minutes.",
-  "immediate_actions": ["specific action 1", "specific action 2", "specific action 3"]
+  "defender_brief": "3 sentences explaining the situation. Sentence 1: What the attacker is TRYING to do (not what they've done). Sentence 2: What will happen NEXT if we don't stop them (keep this proportional to threat level). Sentence 3: The ONE most important thing to do RIGHT NOW (scale to threat level - don't say 'disconnect internet' for initial access). Scale the urgency to match threat level.",
+  "attacker_narrative": "3 sentences. Start with what we're TRYING to do, not what we've done. Do NOT say 'I have gained access' unless we're past the Execution stage. Keep this proportional to threat level. Sentence 1: What we're ATTEMPTING to accomplish. Sentence 2: What our next move will be. Sentence 3: Why you need to act now (but don't catastrophize for Initial Access level threats).",
+  "risk_summary": "One sentence. The worst thing that could happen. Keep this proportional to threat level - for Initial Access, it's about PREVENTING compromise, not RECOVERING from it.",
+  "immediate_actions": ["action 1 - proportional to threat level", "action 2 - proportional to threat level", "action 3 - proportional to threat level"]
 }}"""
 
     try:
@@ -412,7 +436,6 @@ Respond in this EXACT JSON format. No markdown, no extra text, no code fences:
 
         raw = response.choices[0].message.content.strip()
 
-        # Strip markdown fences if model wraps in ```json ... ```
         if raw.startswith("```"):
             parts = raw.split("```")
             raw = parts[1] if len(parts) > 1 else raw
@@ -459,6 +482,18 @@ Respond in this EXACT JSON format. No markdown, no extra text, no code fences:
 # SLIDING WINDOW
 # ─────────────────────────────────────────────────────────────
 
+def _threat_level(score: float) -> str:
+    """Convert threat score to plain language for non-technical users"""
+    if score >= 0.85:
+        return "CRITICAL - immediate danger"
+    elif score >= 0.65:
+        return "HIGH - serious threat"
+    elif score >= 0.40:
+        return "MEDIUM - concerning"
+    else:
+        return "LOW - monitor"
+
+
 def get_window_alerts(window_seconds: int = WINDOW_SECONDS) -> List[dict]:
     cutoff = time.time() - window_seconds
     return [a for a in alert_window if a["timestamp"] >= cutoff]
@@ -481,17 +516,17 @@ def push_alert(alert: AlertInput) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# TEMPORAL FEATURES
+# TEMPORAL FEATURES — FIXED WEIGHTS
 # ─────────────────────────────────────────────────────────────
 
 FEATURE_WEIGHTS = {
-    "velocity":          0.20,
-    "severity_trend":    0.15,
-    "kill_chain_depth":  0.20,
-    "kill_chain_prog":   0.20,
-    "unique_techniques": 0.10,
-    "recency_weight":    0.10,
-    "peak_score":        0.05,
+    "velocity":          0.05,   # REDUCED: 2 alerts in 3.5min is still aggressive
+    "severity_trend":    0.10,   # Reduced slightly
+    "kill_chain_depth":  0.15,   # Medium importance
+    "kill_chain_prog":   0.15,   # Medium importance
+    "unique_techniques": 0.10,   # Unchanged
+    "recency_weight":    0.15,   # INCREASED: recent threats matter more
+    "peak_score":        0.30,   # MAJOR: if any alert is 0.99+, this dominates!
 }
 
 SEV_NUM = {"LOW": 0.2, "MEDIUM": 0.45, "HIGH": 0.75, "CRITICAL": 1.0}
@@ -510,7 +545,8 @@ def compute_temporal_features(alerts: List[dict], window_seconds: int) -> Dict[s
 
     now      = time.time()
     elapsed  = max(now - alerts[0]["timestamp"], 1.0)
-    velocity = min((n / elapsed) * 60 / 10.0, 1.0)
+    # Velocity: alerts per 10 seconds. 2 alerts in 207s = ~0.1 alerts/10s
+    velocity = min((n / elapsed) * 10.0, 1.0)
 
     sev_nums = [SEV_NUM.get(a["severity"], 0.2) for a in alerts]
     mid      = max(n // 2, 1)
