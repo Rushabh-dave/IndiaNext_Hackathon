@@ -1,9 +1,10 @@
-# AEGIS — Threat Detection Backend v4.3
-# Phase 1: Phishing Email + Malicious URL Detection
-# Phase 2: Temporal Fusion Layer + Real SHAP Explainability
-# Phase 3: Groq AI Narrative Engine
-# Phase 4: Prompt Injection + Image Deepfake Detection
+# AEGIS — Threat Detection Backend v4.4
+# Phase 1:  Phishing Email + Malicious URL Detection
+# Phase 2:  Temporal Fusion Layer + Real SHAP Explainability
+# Phase 3:  Groq AI Narrative Engine
+# Phase 4:  Prompt Injection + Image Deepfake Detection
 # Phase 4b: Audio Deepfake Detection (wav2vec2-large-xlsr)
+# Phase 4.4 Lazy / Background Model Loading (stdlib only — no new deps)
 
 # ── API Framework ──────────────────────────────────────────────
 fastapi
@@ -31,7 +32,7 @@ groq
 # ── Anthropic SDK ──────────────────────────────────────────────
 anthropic
 
-# ── Image Processing (Deepfake Detection) ──────────────────────
+# ── Image Processing (Image Deepfake Detection) ────────────────
 pillow
 opencv-python
 
