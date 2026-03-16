@@ -1,13 +1,14 @@
 # main.py
 # ─────────────────────────────────────────────────────────────
-# AEGIS — Phase 1 + Phase 2 + Phase 3 + Phase 4
-# v4.2 — Phishing + URL + Prompt Injection + Image Deepfake
+# AEGIS — Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 4b
+# v4.3 — Phishing + URL + Prompt Injection + Image Deepfake + Audio Deepfake
 #
 # Endpoints:
 #   POST /analyze/phishing          — phishing email detection + SHAP
 #   POST /analyze/url               — malicious URL detection + SHAP
 #   POST /analyze/prompt-injection  — prompt injection detection + SHAP
 #   POST /analyze/deepfake          — deepfake IMAGE detection (ViT)
+#   POST /analyze/deepfake-audio    — deepfake AUDIO detection (wav2vec2)
 #   POST /ingest/alert              — push alert into sliding window
 #   POST /analyze/temporal          — temporal fusion analysis
 #   GET  /alerts/window             — view current window
@@ -23,6 +24,8 @@ from transformers import (
     AutoModelForSequenceClassification,
     ViTForImageClassification,
     ViTImageProcessor,
+    Wav2Vec2ForSequenceClassification,
+    Wav2Vec2FeatureExtractor,
 )
 from urllib.parse import urlparse
 from typing import Optional
@@ -30,6 +33,8 @@ from PIL import Image
 import torch
 import io
 import os
+import librosa
+import numpy as np
 
 from temporal_fusion import (
     AlertInput,
@@ -42,13 +47,15 @@ from temporal_fusion import (
     init_url_explainer,
     init_prompt_injection_explainer,
     init_deepfake_explainer,
+    init_audio_explainer,
     explain_phishing_input,
     explain_url_input,
     explain_prompt_injection_input,
     explain_deepfake_input,
+    explain_audio_input,
 )
 
-app = FastAPI(title="AEGIS Threat Detection", version="4.2.0")
+app = FastAPI(title="AEGIS Threat Detection", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,18 +97,26 @@ prompt_inj_model = AutoModelForSequenceClassification.from_pretrained(
 prompt_inj_model.eval()
 print("Prompt injection model ready.")
 
-print("Loading deepfake detection model...")
+print("Loading image deepfake detection model...")
 DEEPFAKE_MODEL_ID  = "prithivMLmods/Deep-Fake-Detector-v2-Model"
 deepfake_processor = ViTImageProcessor.from_pretrained(DEEPFAKE_MODEL_ID)
 deepfake_model     = ViTForImageClassification.from_pretrained(DEEPFAKE_MODEL_ID)
 deepfake_model.eval()
-print("Deepfake model ready.")
+print("Image deepfake model ready.")
+
+print("Loading audio deepfake detection model...")
+AUDIO_MODEL_ID       = "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification"
+audio_extractor      = Wav2Vec2FeatureExtractor.from_pretrained(AUDIO_MODEL_ID)
+audio_deepfake_model = Wav2Vec2ForSequenceClassification.from_pretrained(AUDIO_MODEL_ID)
+audio_deepfake_model.eval()
+print("Audio deepfake model ready.")
 
 # Init SHAP explainers
 init_phishing_explainer(phishing_tokenizer, phishing_model)
 init_url_explainer(url_tokenizer, url_model)
 init_prompt_injection_explainer(prompt_inj_tokenizer, prompt_inj_model)
 init_deepfake_explainer(deepfake_model, deepfake_processor)
+init_audio_explainer(audio_deepfake_model, audio_extractor)
 
 print("✅ All models + SHAP explainers ready. Server starting...")
 
@@ -475,6 +490,111 @@ async def analyze_deepfake(file: UploadFile = File(...)):
 
 
 # ─────────────────────────────────────────────────────────────
+# ENDPOINT 4b — POST /analyze/deepfake-audio  (AUDIO only)
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/analyze/deepfake-audio")
+async def analyze_deepfake_audio(file: UploadFile = File(...)):
+    """
+    Analyze an AUDIO file for AI-generated / cloned speech detection.
+    Accepts : wav, mp3, flac, ogg, m4a
+    Model   : Gustking/wav2vec2-large-xlsr-deepfake-audio-classification
+    Labels  : 'Real' (authentic) | 'Fake' (AI-generated / voice-cloned)
+    Notes   : Audio is resampled to 16 kHz mono. Files >30 s are truncated.
+    """
+    TARGET_SR = 16_000
+    MAX_SECS  = 30          # truncate long files to keep latency reasonable
+
+    valid_extensions = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+    file_ext = os.path.splitext(file.filename or "")[-1].lower()
+
+    if file_ext not in valid_extensions:
+        return {
+            "error":    f"Invalid file type '{file_ext}'. Supported: {', '.join(valid_extensions)}",
+            "filename": file.filename,
+        }
+
+    try:
+        content = await file.read()
+        wav_buf = io.BytesIO(content)
+        waveform, sr = librosa.load(wav_buf, sr=TARGET_SR, mono=True)
+    except Exception as e:
+        return {"error": f"Cannot decode audio: {str(e)}", "filename": file.filename}
+
+    # Truncate to MAX_SECS
+    max_samples = TARGET_SR * MAX_SECS
+    if len(waveform) > max_samples:
+        waveform = waveform[:max_samples]
+
+    duration_secs = round(len(waveform) / TARGET_SR, 2)
+
+    try:
+        deepfake_score, confidence, label = explain_audio_input(waveform)
+    except Exception as e:
+        return {"error": f"Model inference failed: {str(e)}", "filename": file.filename}
+
+    is_threat = label == "Fake"
+    verdict   = "FAKE_AUDIO_DETECTED" if is_threat else "AUTHENTIC_AUDIO"
+    severity  = severity_from_score(deepfake_score)
+
+    explanation = (
+        f"Audio classified as AI-GENERATED / VOICE-CLONED ({deepfake_score * 100:.1f}% confidence). "
+        "Synthetic speech patterns detected — this audio may be a voice clone or TTS output."
+        if is_threat else
+        f"Audio appears AUTHENTIC ({(1 - deepfake_score) * 100:.1f}% confidence). "
+        "No synthetic speech indicators detected."
+    )
+
+    result = {
+        "verdict":            verdict,
+        "severity":           severity,
+        "threat_score":       round(deepfake_score, 4),
+        "confidence":         round(confidence, 4),
+        "predicted_label":    label,
+        "filename":           file.filename,
+        "duration_seconds":   duration_secs,
+        "sample_rate_used":   TARGET_SR,
+        "explanation":        explanation,
+        "mitre_technique":    "T1656 - Impersonation (Audio Deepfake)" if is_threat else None,
+        "recommended_action": (
+            "Do not trust or act on this audio. Verify via a live call to the claimed speaker. "
+            "Preserve as evidence and escalate to your fraud/security team."
+            if is_threat else
+            "Audio appears authentic."
+        ),
+    }
+
+    if is_threat:
+        shap_result = {
+            "type":                "audio_deepfake",
+            "model_deepfake_prob": round(deepfake_score, 4),
+            "confidence":          round(confidence, 4),
+            "predicted_label":     label,
+            "duration_seconds":    duration_secs,
+            "interpretation": (
+                f"wav2vec2 model detected {deepfake_score * 100:.1f}% probability of synthetic speech. "
+                "Indicators may include unnatural prosody, spectral artefacts, or TTS/VC fingerprints."
+            ),
+        }
+        result["shap"] = shap_result
+        push_alert(AlertInput(
+            alert_type      = "audio_deepfake",
+            threat_score    = round(deepfake_score, 4),
+            severity        = severity,
+            mitre_technique = "T1656",
+            detail          = {
+                "verdict":          verdict,
+                "filename":         file.filename,
+                "duration_seconds": duration_secs,
+                "shap":             shap_result,
+            },
+        ))
+        result["ingested_to_window"] = True
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
 # ENDPOINT 5 — POST /ingest/alert
 # ─────────────────────────────────────────────────────────────
 
@@ -531,15 +651,17 @@ def health():
         _url_base_value,
         _prompt_inj_base_value,
         _deepfake_base_value,
+        _audio_base_value,
     )
     return {
         "status":  "ok",
-        "version": "4.2.0",
+        "version": "4.3.0",
         "models": {
             "phishing":         "cybersectony/phishing-email-detection-distilbert_v2.1",
             "url":              "kmack/malicious-url-detection",
             "prompt_injection": "protectai/deberta-v3-base-prompt-injection-v2",
-            "deepfake":         "prithivMLmods/Deep-Fake-Detector-v2-Model (ViT, image-only)",
+            "deepfake_image":   "prithivMLmods/Deep-Fake-Detector-v2-Model (ViT, image-only)",
+            "deepfake_audio":   "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification",
         },
         "shap": {
             "method":                "KernelExplainer on output-probability space",
@@ -547,6 +669,7 @@ def health():
             "url_base_value":        round(_url_base_value, 4)         if _url_base_value         else None,
             "prompt_inj_base_value": round(_prompt_inj_base_value, 4) if _prompt_inj_base_value else None,
             "deepfake_base_value":   round(_deepfake_base_value, 4)   if _deepfake_base_value   else None,
+            "audio_base_value":      round(_audio_base_value, 4)       if _audio_base_value       else None,
             "background_size":       10,
             "nsamples":              100,
         },

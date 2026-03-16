@@ -1,11 +1,12 @@
-# temporal_fusion.py (v4.2 - Full Merge)
+# temporal_fusion.py (v4.3 - Full Merge)
 # ─────────────────────────────────────────────────────────────
 # Combines:
 #   - v3.2: Prompt injection SHAP + tactic detection + Groq narrative
 #           Fixed temporal weights (peak_score=0.30, velocity=0.05)
 #   - v4.1: Image deepfake detection (ViT classifier)
+#   - v4.3: Audio deepfake detection (wav2vec2-large-xlsr)
 #
-# All 4 explainers: phishing, url, prompt_injection, deepfake
+# All 5 explainers: phishing, url, prompt_injection, image deepfake, audio deepfake
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -15,6 +16,7 @@ import torch
 import numpy as np
 import time
 import math
+import librosa
 from PIL import Image
 from dotenv import load_dotenv
 from collections import deque
@@ -22,6 +24,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, field_validator
 from groq import Groq
+from transformers import Wav2Vec2ForSequenceClassification, Wav2Vec2FeatureExtractor
 
 load_dotenv()
 
@@ -89,11 +92,13 @@ _phishing_predict_fn   = None
 _url_predict_fn        = None
 _prompt_inj_predict_fn = None
 _deepfake_predict_fn   = None
+_audio_predict_fn      = None
 
 _phishing_base_value   = None
 _url_base_value        = None
 _prompt_inj_base_value = None
 _deepfake_base_value   = None
+_audio_base_value      = None
 
 PHISHING_BACKGROUND = [
     "Hello, please find attached the meeting notes.",
@@ -126,6 +131,10 @@ PROMPT_INJECTION_BACKGROUND = [
     "How do I make pasta carbonara?",
     "What is the difference between Python 2 and Python 3?",
 ]
+
+# Audio background: 2-second silence clips at 16 kHz
+_AUDIO_TARGET_SR = 16_000
+_AUDIO_BG_CLIPS  = 5
 
 
 # ─────────────────────────────────────────────────────────────
@@ -198,6 +207,38 @@ def _make_deepfake_predict(model, processor):
     return predict
 
 
+def _make_audio_predict(model, extractor, target_sr: int = _AUDIO_TARGET_SR):
+    """
+    Wav2Vec2ForSequenceClassification —
+    Gustking/wav2vec2-large-xlsr-deepfake-audio-classification
+
+    Expected label mapping (verify against model config.json at load time):
+        0 → real  (authentic speech)
+        1 → fake  (AI-generated / voice-cloned)
+
+    Returns [real_prob, fake_prob] — class_idx=1 is the threat.
+    """
+    def predict(waveforms: List[np.ndarray]) -> np.ndarray:
+        results = []
+        with torch.no_grad():
+            for wav in waveforms:
+                if not isinstance(wav, np.ndarray):
+                    wav = np.array(wav, dtype=np.float32)
+                inputs = extractor(
+                    wav,
+                    sampling_rate=target_sr,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                logits = model(**inputs).logits
+                probs  = torch.softmax(logits[0], dim=0).tolist()
+                # probs[0] = real, probs[1] = fake
+                results.append([probs[0], probs[1]])
+        return np.array(results, dtype=float)
+
+    return predict
+
+
 # ─────────────────────────────────────────────────────────────
 # INIT FUNCTIONS
 # ─────────────────────────────────────────────────────────────
@@ -239,7 +280,7 @@ def init_deepfake_explainer(model, processor):
     global _deepfake_predict_fn, _deepfake_base_value
     if _deepfake_predict_fn is not None:
         return
-    print("Initializing deepfake SHAP explainer...")
+    print("Initializing image deepfake SHAP explainer...")
     _deepfake_predict_fn = _make_deepfake_predict(model, processor)
     bg_images = [
         Image.fromarray(np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8))
@@ -247,7 +288,28 @@ def init_deepfake_explainer(model, processor):
     ]
     bg_preds = _deepfake_predict_fn(bg_images)
     _deepfake_base_value = float(np.mean(bg_preds[:, 1]))
-    print(f"Deepfake SHAP ready. Base value: {_deepfake_base_value:.4f}")
+    print(f"Image deepfake SHAP ready. Base value: {_deepfake_base_value:.4f}")
+
+
+def init_audio_explainer(
+    model: Wav2Vec2ForSequenceClassification,
+    extractor: Wav2Vec2FeatureExtractor,
+    target_sr: int = _AUDIO_TARGET_SR,
+):
+    """
+    Initialize the audio deepfake predict function and compute the baseline
+    fake-probability from silent background clips.
+    """
+    global _audio_predict_fn, _audio_base_value
+    if _audio_predict_fn is not None:
+        return
+    print("Initializing audio deepfake SHAP explainer...")
+    _audio_predict_fn = _make_audio_predict(model, extractor, target_sr)
+    # Background: N silent clips of 2 s
+    bg_clips = [np.zeros(target_sr * 2, dtype=np.float32) for _ in range(_AUDIO_BG_CLIPS)]
+    bg_preds = _audio_predict_fn(bg_clips)
+    _audio_base_value = float(np.mean(bg_preds[:, 1]))
+    print(f"Audio deepfake SHAP ready. Base value: {_audio_base_value:.4f}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -418,11 +480,11 @@ def explain_prompt_injection_input(text: str) -> dict:
 
 def explain_deepfake_input(image: Image.Image) -> Tuple[float, float, str]:
     """
-    Run deepfake detection on a single PIL image.
+    Run image deepfake detection on a single PIL image.
     Returns: (deepfake_prob, confidence, label)
     """
     if _deepfake_predict_fn is None or _deepfake_base_value is None:
-        raise ValueError("Deepfake explainer not initialized.")
+        raise ValueError("Image deepfake explainer not initialized.")
     try:
         result        = _deepfake_predict_fn([image])      # (1, 2)
         deepfake_prob = float(result[0, 1])
@@ -430,8 +492,29 @@ def explain_deepfake_input(image: Image.Image) -> Tuple[float, float, str]:
         label         = "Deepfake" if deepfake_prob > 0.5 else "Realism"
         return deepfake_prob, confidence, label
     except Exception as e:
-        print(f"Deepfake analysis error: {e}")
+        print(f"Image deepfake analysis error: {e}")
         return 0.0, 0.0, "Realism"
+
+
+def explain_audio_input(waveform: np.ndarray) -> Tuple[float, float, str]:
+    """
+    Run audio deepfake detection on a 16 kHz mono float32 numpy waveform.
+    Returns: (deepfake_prob, confidence, label)
+      - deepfake_prob : probability the audio is AI-generated / voice-cloned
+      - confidence    : absolute deviation from the silent-clip baseline
+      - label         : 'Fake' | 'Real'
+    """
+    if _audio_predict_fn is None or _audio_base_value is None:
+        raise ValueError("Audio deepfake explainer not initialized.")
+    try:
+        result        = _audio_predict_fn([waveform])   # (1, 2)
+        deepfake_prob = float(result[0, 1])
+        confidence    = abs(deepfake_prob - _audio_base_value)
+        label         = "Fake" if deepfake_prob > 0.5 else "Real"
+        return deepfake_prob, confidence, label
+    except Exception as e:
+        print(f"Audio deepfake analysis error: {e}")
+        return 0.0, 0.0, "Real"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -485,10 +568,11 @@ def _build_threat_context(alert_types: list, timeline: list) -> str:
     """
     blocks = []
 
-    phishing_details  = [t for t in timeline if t.get("alert_type") == "phishing"]
-    url_details       = [t for t in timeline if t.get("alert_type") == "url"]
-    injection_details = [t for t in timeline if t.get("alert_type") == "prompt_injection"]
-    deepfake_details  = [t for t in timeline if t.get("alert_type") == "deepfake"]
+    phishing_details      = [t for t in timeline if t.get("alert_type") == "phishing"]
+    url_details           = [t for t in timeline if t.get("alert_type") == "url"]
+    injection_details     = [t for t in timeline if t.get("alert_type") == "prompt_injection"]
+    deepfake_details      = [t for t in timeline if t.get("alert_type") == "deepfake"]
+    audio_deepfake_details = [t for t in timeline if t.get("alert_type") == "audio_deepfake"]
 
     if phishing_details:
         top   = max(phishing_details, key=lambda x: x["threat_score"])
@@ -564,8 +648,23 @@ def _build_threat_context(alert_types: list, timeline: list) -> str:
             f"  Implement liveness detection or video verification in your identity pipeline."
         )
 
+    if audio_deepfake_details:
+        top  = max(audio_deepfake_details, key=lambda x: x["threat_score"])
+        shap = top.get("shap_note", "")
+        blocks.append(
+            f"DEEPFAKE AUDIO DETECTED:\n"
+            f"- An AI-generated or voice-cloned audio clip was submitted — likely impersonating a trusted person.\n"
+            f"- Attacker goal: bypass voice authentication, authorize fraudulent transactions, or conduct social engineering.\n"
+            f"- SHAP analysis: {shap if shap else 'Audio features deviate from authentic human speech patterns.'}\n"
+            f"- Specific risk: if trusted, attacker can impersonate executives or customers to authorize actions (e.g. wire transfers, account changes).\n"
+            f"- Required actions: Do NOT act on instructions from this audio clip.\n"
+            f"  Verify via a live callback to the claimed speaker using a known-good number.\n"
+            f"  Preserve the audio as forensic evidence and escalate to your fraud team.\n"
+            f"  Disable or add liveness checks to any voice-authenticated workflows."
+        )
+
     for atype in alert_types:
-        if atype not in ("phishing", "url", "prompt_injection", "deepfake"):
+        if atype not in ("phishing", "url", "prompt_injection", "deepfake", "audio_deepfake"):
             blocks.append(
                 f"THREAT TYPE: {atype.upper()}\n"
                 f"- Suspicious activity detected. Review logs and investigate the source."
@@ -629,13 +728,14 @@ def generate_narrative(analysis: dict) -> dict:
         f"{threat_context}\n\n"
         "YOUR TASK\n"
         "=========\n"
-        "1. Name the SPECIFIC attack (e.g. 'PayPal phishing', 'deepfake KYC fraud', 'AI prompt injection')\n"
+        "1. Name the SPECIFIC attack (e.g. 'PayPal phishing', 'deepfake KYC fraud', 'AI prompt injection', 'voice-cloned CEO fraud')\n"
         "   — NEVER say 'cyber attack' or 'suspicious activity' generically\n"
         "2. Say in one sentence what the attacker is after (money, credentials, data, AI access)\n"
         "3. Give 3 CONCRETE actions — not generic advice\n"
         "   GOOD: 'Reset all PayPal-linked passwords immediately'\n"
         "   GOOD: 'Block domain paypa1.com in your firewall right now'\n"
         "   GOOD: 'Flag the KYC submission from account ID in question for manual fraud review'\n"
+        "   GOOD: 'Call the CFO back on their personal mobile to verify the wire transfer request'\n"
         "   BAD:  'Monitor the situation' / 'Contact IT' / 'Stay vigilant'\n"
         f"4. Scale urgency: CRITICAL = act in minutes, MEDIUM = act today\n\n"
         "Respond ONLY in this exact JSON (no markdown, no code fences):\n"
@@ -670,6 +770,8 @@ def generate_narrative(analysis: dict) -> dict:
                 "model_used": "fallback"}
     except Exception as e:
         return {"status": "error", "error": str(e), "model_used": "fallback"}
+
+
 def get_window_alerts(window_seconds: int = WINDOW_SECONDS) -> List[dict]:
     cutoff = time.time() - window_seconds
     return [a for a in alert_window if a["timestamp"] >= cutoff]
