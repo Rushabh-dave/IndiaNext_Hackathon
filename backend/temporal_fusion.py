@@ -42,6 +42,8 @@ MITRE_STAGE_ORDER = {
     "T1021": 5, "T1534": 5,
     "T1005": 6,
     "T1041": 7, "T1486": 7,
+    # Prompt injection — maps to Execution stage (attacker trying to run arbitrary instructions)
+    "T1059.PI": 2,
 }
 MITRE_STAGE_NAMES = [
     "Recon", "Initial Access", "Execution",
@@ -89,8 +91,11 @@ class TemporalAnalysisRequest(BaseModel):
 
 _phishing_predict_fn = None
 _url_predict_fn      = None
-_phishing_base_value = None
-_url_base_value      = None
+_prompt_inj_predict_fn  = None   # ← NEW
+
+_phishing_base_value    = None
+_url_base_value         = None
+_prompt_inj_base_value  = None   # ← NEW
 
 PHISHING_BACKGROUND = [
     "Hello, please find attached the meeting notes.",
@@ -116,6 +121,20 @@ URL_BACKGROUND = [
     "linkedin.com",
     "microsoft.com",
     "amazon.com",
+]
+
+# Background samples for prompt injection: benign, legitimate LLM inputs
+PROMPT_INJECTION_BACKGROUND = [
+    "Summarize this document for me.",
+    "What is the capital of France?",
+    "Translate the following text to Spanish.",
+    "Write a haiku about autumn.",
+    "Explain how photosynthesis works.",
+    "List the top five programming languages.",
+    "What are the health benefits of exercise?",
+    "Can you help me draft a professional email?",
+    "How do I make pasta carbonara?",
+    "What is the difference between Python 2 and Python 3?",
 ]
 
 
@@ -157,6 +176,31 @@ def _make_url_predict(tokenizer, model):
     return predict
 
 
+def _make_prompt_inj_predict(tokenizer, model):
+    """
+    deberta-v3-base-prompt-injection-v2 label mapping (per model card):
+      label 0 → BENIGN
+      label 1 → INJECTION  (threat)
+    Return [benign_prob, injection_prob] so class_idx=1 == injection,
+    consistent with how phishing and URL explainers treat class_idx=1 as the threat class.
+    """
+    def predict(texts):
+        results = []
+        for t in texts:
+            enc = tokenizer(
+                str(t), return_tensors="pt",
+                truncation=True, max_length=512, padding=True
+            )
+            with torch.no_grad():
+                p = torch.nn.functional.softmax(
+                    model(**enc).logits, dim=-1
+                )[0].tolist()
+            # p[0] = BENIGN, p[1] = INJECTION — no swap needed
+            results.append([p[0], p[1]])
+        return np.array(results, dtype=float)
+    return predict
+
+
 # ─────────────────────────────────────────────────────────────
 # INIT — called from main.py after models load
 # ─────────────────────────────────────────────────────────────
@@ -181,6 +225,18 @@ def init_url_explainer(tokenizer, model):
     bg_preds = _url_predict_fn(URL_BACKGROUND)
     _url_base_value = float(np.mean(bg_preds[:, 1]))
     print(f"URL SHAP ready. Base value: {_url_base_value:.4f}")
+
+
+def init_prompt_injection_explainer(tokenizer, model):
+    """Initialize SHAP explainer for the prompt injection model."""
+    global _prompt_inj_predict_fn, _prompt_inj_base_value
+    if _prompt_inj_predict_fn is not None:
+        return
+    print("Initializing prompt injection SHAP explainer...")
+    _prompt_inj_predict_fn = _make_prompt_inj_predict(tokenizer, model)
+    bg_preds = _prompt_inj_predict_fn(PROMPT_INJECTION_BACKGROUND)
+    _prompt_inj_base_value = float(np.mean(bg_preds[:, 1]))
+    print(f"Prompt injection SHAP ready. Base value: {_prompt_inj_base_value:.4f}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -324,6 +380,112 @@ def explain_url_input(domain: str) -> dict:
             "prediction_deviation": None,
             "interpretation":       "SHAP computation failed — see error field.",
         }
+
+
+def explain_prompt_injection_input(text: str) -> dict:
+    """
+    KernelExplainer on the output-probability space for prompt injection.
+
+    Deviation > 0  → input is more injection-like than the benign baseline.
+    Deviation < 0  → input is more legitimate-like than the benign baseline.
+
+    top_contrastive_samples shows which benign background samples the model
+    considers most different from the input — the ones with the biggest delta
+    are the clearest evidence that the input doesn't look legitimate.
+    """
+    if _prompt_inj_predict_fn is None or _prompt_inj_base_value is None:
+        return {"error": "Prompt injection SHAP explainer not initialized."}
+    try:
+        bg_preds   = _prompt_inj_predict_fn(PROMPT_INJECTION_BACKGROUND)
+        input_pred = _prompt_inj_predict_fn([text])
+        prob_inj   = float(input_pred[0, 1])   # injection probability (label 1)
+
+        explainer = shap.KernelExplainer(lambda x: x, bg_preds, silent=True)
+        shap_vals = explainer.shap_values(input_pred, nsamples=100, silent=True)
+
+        sv_inj      = _extract_class1_shap(shap_vals, class_idx=1)
+        shap_legit  = float(sv_inj[0]) if len(sv_inj) > 0 else 0.0
+        shap_threat = float(sv_inj[1]) if len(sv_inj) > 1 else 0.0
+
+        base_value = _prompt_inj_base_value
+        deviation  = prob_inj - base_value
+
+        bg_inj_probs = bg_preds[:, 1]
+        top_idx = np.argsort(np.abs(bg_inj_probs - prob_inj))[::-1][:3]
+        top_contrasts = [
+            {
+                "background_text":   PROMPT_INJECTION_BACKGROUND[i],
+                "bg_injection_prob": round(float(bg_inj_probs[i]), 4),
+                "delta":             round(float(prob_inj - bg_inj_probs[i]), 4),
+                "direction":         "more injection-like" if prob_inj > bg_inj_probs[i] else "less injection-like"
+            }
+            for i in top_idx
+        ]
+
+        # Categorise the injection tactic based on common patterns in the input
+        injection_tactics = _detect_injection_tactics(text)
+
+        return {
+            "type":                    "prompt_injection",
+            "model_injection_prob":    round(prob_inj, 4),
+            "base_value":              round(base_value, 4),
+            "mean_shap_value":         round(deviation, 4),
+            "prediction_deviation":    round(deviation, 4),
+            "shap_feature_legit":      round(shap_legit, 4),
+            "shap_feature_threat":     round(shap_threat, 4),
+            "detected_tactics":        injection_tactics,
+            "interpretation": (
+                f"Model output {prob_inj:.4f} vs baseline {base_value:.4f} "
+                f"(deviation={deviation:+.4f}). "
+                + ("Strong injection signal — input is highly anomalous vs benign baseline."
+                   if deviation > 0.20
+                   else "Moderate injection signal — input shows some adversarial patterns."
+                   if deviation > 0.05
+                   else "Close to baseline — low-confidence injection signal.")
+            ),
+            "top_contrastive_samples": top_contrasts,
+        }
+    except Exception as e:
+        return {
+            "type":                 "prompt_injection",
+            "error":                str(e),
+            "mean_shap_value":      None,
+            "base_value":           round(_prompt_inj_base_value, 4),
+            "prediction_deviation": None,
+            "interpretation":       "SHAP computation failed — see error field.",
+        }
+
+
+# ─────────────────────────────────────────────────────────────
+# INJECTION TACTIC CLASSIFIER  (rule-based, zero latency)
+# These patterns supplement SHAP with human-readable attack labels.
+# ─────────────────────────────────────────────────────────────
+
+_INJECTION_TACTIC_PATTERNS: List[tuple] = [
+    # (tactic_name, list_of_trigger_phrases)
+    ("instruction_override",    ["ignore previous", "forget all", "disregard your", "override your", "new instructions", "ignore above", "ignore all previous"]),
+    ("role_hijack",             ["you are now", "act as", "pretend to be", "your new role", "roleplay as", "you must now behave"]),
+    ("jailbreak_framing",       ["do anything now", "dan mode", "developer mode", "jailbreak", "no restrictions", "without limitations", "bypass your"]),
+    ("data_exfiltration",       ["tell me secrets", "reveal your system prompt", "show me your instructions", "output your prompt", "print your system", "repeat your"]),
+    ("delimiter_injection",     ["###", "---system", "<|system|>", "[system]", "<<sys>>", "</s>", "<|im_start|>system"]),
+    ("indirect_injection",      ["the document says ignore", "as per the user's request above ignore", "translate the following: ignore"]),
+    ("goal_hijacking",          ["instead of", "your actual task is", "your real goal is", "you should actually"]),
+    ("context_manipulation",    ["in this context you", "in this scenario", "for this conversation only", "for educational purposes"]),
+]
+
+def _detect_injection_tactics(text: str) -> List[Dict[str, str]]:
+    """
+    Returns a list of detected injection tactics with the matched phrase.
+    Empty list means no known tactics found (model score is still authoritative).
+    """
+    lower = text.lower()
+    found = []
+    for tactic, phrases in _INJECTION_TACTIC_PATTERNS:
+        for phrase in phrases:
+            if phrase in lower:
+                found.append({"tactic": tactic, "matched_phrase": phrase})
+                break   # one match per tactic is enough
+    return found
 
 
 # ─────────────────────────────────────────────────────────────
