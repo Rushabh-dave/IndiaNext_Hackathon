@@ -1,12 +1,13 @@
 # main.py
 # ─────────────────────────────────────────────────────────────
-# AEGIS — Phase 1 + Phase 2 + Prompt Injection
-# v3.2 — prompt injection detection added (protectai/deberta-v3-base-prompt-injection-v2)
+# AEGIS — Phase 1 + Phase 2 + Phase 3 + Phase 4
+# v4.2 — Phishing + URL + Prompt Injection + Image Deepfake
 #
 # Endpoints:
 #   POST /analyze/phishing          — phishing email detection + SHAP
 #   POST /analyze/url               — malicious URL detection + SHAP
-#   POST /analyze/prompt-injection  — prompt injection detection + SHAP + tactic tagging
+#   POST /analyze/prompt-injection  — prompt injection detection + SHAP
+#   POST /analyze/deepfake          — deepfake IMAGE detection (ViT)
 #   POST /ingest/alert              — push alert into sliding window
 #   POST /analyze/temporal          — temporal fusion analysis
 #   GET  /alerts/window             — view current window
@@ -14,13 +15,21 @@
 #   GET  /health
 # ─────────────────────────────────────────────────────────────
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    ViTForImageClassification,
+    ViTImageProcessor,
+)
 from urllib.parse import urlparse
 from typing import Optional
+from PIL import Image
 import torch
+import io
+import os
 
 from temporal_fusion import (
     AlertInput,
@@ -31,13 +40,15 @@ from temporal_fusion import (
     alert_window,
     init_phishing_explainer,
     init_url_explainer,
-    init_prompt_injection_explainer,       # ← NEW
+    init_prompt_injection_explainer,
+    init_deepfake_explainer,
     explain_phishing_input,
     explain_url_input,
-    explain_prompt_injection_input,        # ← NEW
+    explain_prompt_injection_input,
+    explain_deepfake_input,
 )
 
-app = FastAPI(title="AEGIS Threat Detection", version="3.2.0")
+app = FastAPI(title="AEGIS Threat Detection", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,7 +80,6 @@ url_model     = AutoModelForSequenceClassification.from_pretrained(
 url_model.eval()
 print("URL model ready.")
 
-# ── NEW: Prompt injection model ──────────────────────────────
 print("Loading prompt injection model...")
 prompt_inj_tokenizer = AutoTokenizer.from_pretrained(
     "protectai/deberta-v3-base-prompt-injection-v2"
@@ -79,12 +89,19 @@ prompt_inj_model = AutoModelForSequenceClassification.from_pretrained(
 )
 prompt_inj_model.eval()
 print("Prompt injection model ready.")
-# ────────────────────────────────────────────────────────────
 
-# Init SHAP — runs 10 background predictions per model, no forward passes on user data yet
+print("Loading deepfake detection model...")
+DEEPFAKE_MODEL_ID  = "prithivMLmods/Deep-Fake-Detector-v2-Model"
+deepfake_processor = ViTImageProcessor.from_pretrained(DEEPFAKE_MODEL_ID)
+deepfake_model     = ViTForImageClassification.from_pretrained(DEEPFAKE_MODEL_ID)
+deepfake_model.eval()
+print("Deepfake model ready.")
+
+# Init SHAP explainers
 init_phishing_explainer(phishing_tokenizer, phishing_model)
 init_url_explainer(url_tokenizer, url_model)
-init_prompt_injection_explainer(prompt_inj_tokenizer, prompt_inj_model)   # ← NEW
+init_prompt_injection_explainer(prompt_inj_tokenizer, prompt_inj_model)
+init_deepfake_explainer(deepfake_model, deepfake_processor)
 
 print("✅ All models + SHAP explainers ready. Server starting...")
 
@@ -163,10 +180,6 @@ PHISHING_LABEL_MAP = {
     3: "phishing_url_alt",
 }
 
-# ── Prompt injection label map for deberta-v3-base-prompt-injection-v2 ──
-# label 0 → INJECTION, label 1 → LEGITIMATE
-PROMPT_INJ_LABEL_MAP = {0: "INJECTION", 1: "LEGITIMATE"}
-
 
 def check_sender_domain(sender: str) -> list:
     if not sender or "@" not in sender:
@@ -191,10 +204,8 @@ def severity_from_score(score: float) -> str:
 
 @app.post("/analyze/phishing")
 def analyze_phishing(body: PhishingEmailInput):
-    # Build input text
     full_text = (f"Subject: {body.subject}\n\n" if body.subject else "") + body.body
 
-    # Model inference
     inputs = phishing_tokenizer(
         full_text, return_tensors="pt", truncation=True, max_length=512
     )
@@ -204,7 +215,7 @@ def analyze_phishing(body: PhishingEmailInput):
         )
 
     scores = {PHISHING_LABEL_MAP[i]: round(p, 4) for i, p in enumerate(probs[0].tolist())}
-    phishing_combined        = scores["phishing_url"] + scores["phishing_url_alt"]
+    phishing_combined           = scores["phishing_url"] + scores["phishing_url_alt"]
     scores["phishing_combined"] = round(phishing_combined, 4)
 
     top_label = max(
@@ -239,7 +250,6 @@ def analyze_phishing(body: PhishingEmailInput):
         ),
     }
 
-    # SHAP + auto-ingest on THREAT only
     if is_threat:
         shap_result = explain_phishing_input(full_text)
         result["shap"] = shap_result
@@ -248,11 +258,7 @@ def analyze_phishing(body: PhishingEmailInput):
             threat_score    = round(phishing_combined, 4),
             severity        = severity,
             mitre_technique = "T1566.001",
-            detail          = {
-                "verdict":   verdict,
-                "top_label": top_label,
-                "shap":      shap_result,
-            },
+            detail          = {"verdict": verdict, "top_label": top_label, "shap": shap_result},
         ))
         result["ingested_to_window"] = True
 
@@ -307,7 +313,6 @@ def analyze_url(body: TextInput):
         ),
     }
 
-    # SHAP + auto-ingest on THREAT only
     if is_threat:
         shap_result = explain_url_input(domain)
         result["shap"] = shap_result
@@ -316,11 +321,7 @@ def analyze_url(body: TextInput):
             threat_score    = round(threat_score, 4),
             severity        = severity,
             mitre_technique = "T1566.002",
-            detail          = {
-                "domain":       domain,
-                "original_url": body.text,
-                "shap":         shap_result,
-            },
+            detail          = {"domain": domain, "original_url": body.text, "shap": shap_result},
         ))
         result["ingested_to_window"] = True
 
@@ -328,12 +329,11 @@ def analyze_url(body: TextInput):
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 3 — POST /analyze/prompt-injection   ← NEW
+# ENDPOINT 3 — POST /analyze/prompt-injection
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze/prompt-injection")
 def analyze_prompt_injection(body: PromptInjectionInput):
-    # Model inference — text only, no context wrapping
     inputs = prompt_inj_tokenizer(
         body.text, return_tensors="pt", truncation=True, max_length=512, padding=True
     )
@@ -343,7 +343,7 @@ def analyze_prompt_injection(body: PromptInjectionInput):
         )
 
     raw_probs = probs[0].tolist()
-    # label 0 = BENIGN, label 1 = INJECTION  (per protectai model card)
+    # label 0 = BENIGN, label 1 = INJECTION (per protectai model card)
     scores = {
         "injection":  round(raw_probs[1], 4),
         "legitimate": round(raw_probs[0], 4),
@@ -356,10 +356,10 @@ def analyze_prompt_injection(body: PromptInjectionInput):
 
     explanation = (
         f"Prompt injection detected ({threat_score * 100:.1f}% confidence). "
-        f"This input appears designed to override, hijack, or manipulate LLM instructions."
+        "This input appears designed to override, hijack, or manipulate LLM instructions."
         if is_threat else
         f"Input appears legitimate ({scores['legitimate'] * 100:.1f}% confidence). "
-        f"No injection patterns detected."
+        "No injection patterns detected."
     )
 
     result = {
@@ -375,11 +375,9 @@ def analyze_prompt_injection(body: PromptInjectionInput):
         ),
     }
 
-    # SHAP + tactic tags + auto-ingest on THREAT only
     if is_threat:
         shap_result = explain_prompt_injection_input(body.text)
         result["shap"] = shap_result
-
         push_alert(AlertInput(
             alert_type      = "prompt_injection",
             threat_score    = round(threat_score, 4),
@@ -396,7 +394,88 @@ def analyze_prompt_injection(body: PromptInjectionInput):
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 4 — POST /ingest/alert
+# ENDPOINT 4 — POST /analyze/deepfake  (IMAGE only)
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/analyze/deepfake")
+async def analyze_deepfake(file: UploadFile = File(...)):
+    """
+    Analyze a single IMAGE for deepfake detection.
+    Accepts: jpg, jpeg, png, webp, bmp
+    Model: prithivMLmods/Deep-Fake-Detector-v2-Model (ViT, 92% accuracy)
+    Labels: 'Realism' (authentic) | 'Deepfake' (manipulated)
+    """
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+    file_ext = os.path.splitext(file.filename or "")[-1].lower()
+
+    if file_ext not in valid_extensions:
+        return {
+            "error": f"Invalid file type '{file_ext}'. Supported: {', '.join(valid_extensions)}",
+            "filename": file.filename,
+        }
+
+    try:
+        content = await file.read()
+        image   = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception as e:
+        return {"error": f"Cannot open image: {str(e)}", "filename": file.filename}
+
+    deepfake_score, confidence, label = explain_deepfake_input(image)
+
+    is_threat = label == "Deepfake"
+    verdict   = "DEEPFAKE_DETECTED" if is_threat else "AUTHENTIC"
+    severity  = severity_from_score(deepfake_score)
+
+    explanation = (
+        f"Image classified as DEEPFAKE ({deepfake_score * 100:.1f}% confidence). "
+        "Signs of AI-based facial manipulation detected."
+        if is_threat else
+        f"Image appears AUTHENTIC ({(1 - deepfake_score) * 100:.1f}% confidence). "
+        "No deepfake indicators detected."
+    )
+
+    result = {
+        "verdict":            verdict,
+        "severity":           severity,
+        "threat_score":       round(deepfake_score, 4),
+        "confidence":         round(confidence, 4),
+        "predicted_label":    label,
+        "filename":           file.filename,
+        "explanation":        explanation,
+        "mitre_technique":    "T1656 - Impersonation (Deepfake)" if is_threat else None,
+        "recommended_action": (
+            "Do not share or use this image. Verify from original sources."
+            if is_threat else "Image appears to be authentic."
+        ),
+    }
+
+    if is_threat:
+        shap_result = {
+            "type":                "deepfake",
+            "model_deepfake_prob": round(deepfake_score, 4),
+            "confidence":          round(confidence, 4),
+            "predicted_label":     label,
+            "interpretation": (
+                f"ViT model detected {deepfake_score * 100:.1f}% probability of deepfake. "
+                "Indicators may include facial inconsistencies, unnatural textures, "
+                "or blending artifacts."
+            ),
+        }
+        result["shap"] = shap_result
+        push_alert(AlertInput(
+            alert_type      = "deepfake",
+            threat_score    = round(deepfake_score, 4),
+            severity        = severity,
+            mitre_technique = "T1656",
+            detail          = {"verdict": verdict, "filename": file.filename, "shap": shap_result},
+        ))
+        result["ingested_to_window"] = True
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# ENDPOINT 5 — POST /ingest/alert
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/ingest/alert")
@@ -412,17 +491,17 @@ def ingest_alert(alert: AlertInput):
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 5 — POST /analyze/temporal
+# ENDPOINT 6 — POST /analyze/temporal
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze/temporal")
 def analyze_temporal(req: TemporalAnalysisRequest = None):
-    window_secs = req.window_seconds if req else WINDOW_SECONDS
+    window_secs = req.window_seconds if req else 300
     return run_temporal_analysis(window_secs)
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 6 — GET /alerts/window
+# ENDPOINT 7 — GET /alerts/window
 # ─────────────────────────────────────────────────────────────
 
 @app.get("/alerts/window")
@@ -432,7 +511,7 @@ def get_window():
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 7 — DELETE /alerts/reset
+# ENDPOINT 8 — DELETE /alerts/reset
 # ─────────────────────────────────────────────────────────────
 
 @app.delete("/alerts/reset")
@@ -442,27 +521,34 @@ def reset_window():
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 8 — GET /health
+# ENDPOINT 9 — GET /health
 # ─────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    from temporal_fusion import _phishing_base_value, _url_base_value, _prompt_inj_base_value
+    from temporal_fusion import (
+        _phishing_base_value,
+        _url_base_value,
+        _prompt_inj_base_value,
+        _deepfake_base_value,
+    )
     return {
         "status":  "ok",
-        "version": "3.2.0",
+        "version": "4.2.0",
         "models": {
             "phishing":         "cybersectony/phishing-email-detection-distilbert_v2.1",
             "url":              "kmack/malicious-url-detection",
-            "prompt_injection": "protectai/deberta-v3-base-prompt-injection-v2",   # ← NEW
+            "prompt_injection": "protectai/deberta-v3-base-prompt-injection-v2",
+            "deepfake":         "prithivMLmods/Deep-Fake-Detector-v2-Model (ViT, image-only)",
         },
         "shap": {
-            "method":                    "KernelExplainer on output-probability space",
-            "phishing_base_value":       round(_phishing_base_value, 4)   if _phishing_base_value   else None,
-            "url_base_value":            round(_url_base_value, 4)        if _url_base_value        else None,
-            "prompt_inj_base_value":     round(_prompt_inj_base_value, 4) if _prompt_inj_base_value else None,  # ← NEW
-            "background_size":           10,
-            "nsamples":                  100,
+            "method":                "KernelExplainer on output-probability space",
+            "phishing_base_value":   round(_phishing_base_value, 4)   if _phishing_base_value   else None,
+            "url_base_value":        round(_url_base_value, 4)         if _url_base_value         else None,
+            "prompt_inj_base_value": round(_prompt_inj_base_value, 4) if _prompt_inj_base_value else None,
+            "deepfake_base_value":   round(_deepfake_base_value, 4)   if _deepfake_base_value   else None,
+            "background_size":       10,
+            "nsamples":              100,
         },
         "temporal_window": {
             "active_alerts":  len(get_window_alerts()),
