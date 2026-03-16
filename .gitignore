@@ -1,3 +1,5 @@
+myenv/
+
 # Dependencies
 node_modules/
 .pnp
