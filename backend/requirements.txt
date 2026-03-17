@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.0+cpu
-torchaudio==2.2.0+cpu
+torch==2.4.0+cpu
+torchaudio==2.4.0+cpu
 
 fastapi
 uvicorn[standard]
@@ -8,12 +8,12 @@ python-multipart
 python-dotenv
 pydantic
 pydantic[email]
-transformers
+transformers==4.40.0
 shap
 groq
 anthropic
 pillow
 librosa
 soundfile
-numpy
+numpy<2
 scikit-learn
