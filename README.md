@@ -8,7 +8,7 @@ PhishEye is a full-stack cybersecurity intelligence platform built for the India
 
 | Service | URL |
 |---|---|
-| **Frontend** | Deployed on Vercel |
+| **Frontend** | https://india-next-hackathon-u8hx.vercel.app/ |
 | **Backend API** | [https://indianext-hackathon.onrender.com](https://indianext-hackathon.onrender.com) |
 | **API Health** | [https://indianext-hackathon.onrender.com/health](https://indianext-hackathon.onrender.com/health) |
 
