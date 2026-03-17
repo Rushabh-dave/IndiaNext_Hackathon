@@ -1,4 +1,4 @@
-# temporal_fusion.py (v4.3 - Full Merge)
+# temporal_fusion.py (v4.3 - Full Merge, Lazy-Loaded)
 # ─────────────────────────────────────────────────────────────
 # Combines:
 #   - v3.2: Prompt injection SHAP + tactic detection + Groq narrative
@@ -7,24 +7,21 @@
 #   - v4.3: Audio deepfake detection (wav2vec2-large-xlsr)
 #
 # All 5 explainers: phishing, url, prompt_injection, image deepfake, audio deepfake
+#
+# LAZY LOADING: Heavy deps (torch, transformers, shap, librosa, PIL)
+# are imported inside the functions that need them, NOT at module level.
+# This eliminates deployment timeout caused by eager model loading.
 # ─────────────────────────────────────────────────────────────
 
 import os
 import json
-import shap
-import torch
-import numpy as np
 import time
 import math
-import librosa
-from PIL import Image
 from dotenv import load_dotenv
 from collections import deque
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, field_validator
-from groq import Groq
-from transformers import Wav2Vec2ForSequenceClassification, Wav2Vec2FeatureExtractor
 
 load_dotenv()
 
@@ -32,12 +29,21 @@ WINDOW_SECONDS       = 300
 MAX_ALERTS           = 50
 ESCALATION_THRESHOLD = 3
 
-groq_client = Groq(api_key=os.environ.get("API_KEY"))
+# Groq client — lazy init to avoid import cost at startup
+_groq_client = None
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        from groq import Groq
+        _groq_client = Groq(api_key=os.environ.get("API_KEY"))
+    return _groq_client
+
 
 MITRE_STAGE_ORDER = {
     "T1595": 0, "T1592": 0,
-    "T1566": 1, "T1566.001": 1, "T1566.002": 1, "T1656": 1,   # T1656 = deepfake/impersonation
-    "T1059": 2, "T1078": 2, "T1053": 2, "T1059.PI": 2,        # T1059.PI = prompt injection
+    "T1566": 1, "T1566.001": 1, "T1566.002": 1, "T1656": 1,
+    "T1059": 2, "T1078": 2, "T1053": 2, "T1059.PI": 2,
     "T1547": 3, "T1055": 3,
     "T1548": 4,
     "T1021": 5, "T1534": 5,
@@ -85,7 +91,7 @@ class TemporalAnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────
-# SHAP — global state
+# SHAP — global state (populated lazily on first use)
 # ─────────────────────────────────────────────────────────────
 
 _phishing_predict_fn   = None
@@ -132,68 +138,64 @@ PROMPT_INJECTION_BACKGROUND = [
     "What is the difference between Python 2 and Python 3?",
 ]
 
-# Audio background: 2-second silence clips at 16 kHz
 _AUDIO_TARGET_SR = 16_000
 _AUDIO_BG_CLIPS  = 5
 
 
 # ─────────────────────────────────────────────────────────────
-# PREDICT FUNCTIONS
+# PREDICT FUNCTIONS  (import heavy deps only when called)
 # ─────────────────────────────────────────────────────────────
 
 def _make_phishing_predict(tokenizer, model):
     def predict(texts):
+        import torch
+        import numpy as np
         results = []
         for t in texts:
             enc = tokenizer(str(t), return_tensors="pt", truncation=True, max_length=512, padding=True)
             with torch.no_grad():
                 p = torch.nn.functional.softmax(model(**enc).logits, dim=-1)[0].tolist()
-            results.append([p[0] + p[2], p[1] + p[3]])   # [legit, phishing]
+            results.append([p[0] + p[2], p[1] + p[3]])
         return np.array(results, dtype=float)
     return predict
 
 
 def _make_url_predict(tokenizer, model):
     def predict(domains):
+        import torch
+        import numpy as np
         results = []
         for d in domains:
             enc = tokenizer(str(d), return_tensors="pt", truncation=True, padding=True, max_length=128)
             with torch.no_grad():
                 p = torch.nn.functional.softmax(model(**enc).logits, dim=-1)[0].tolist()
-            results.append([p[0], p[1]])                  # [benign, malicious]
+            results.append([p[0], p[1]])
         return np.array(results, dtype=float)
     return predict
 
 
 def _make_prompt_inj_predict(tokenizer, model):
-    """
-    deberta-v3-base-prompt-injection-v2:
-      label 0 → BENIGN, label 1 → INJECTION
-    Returns [benign_prob, injection_prob] — class_idx=1 is the threat.
-    """
     def predict(texts):
+        import torch
+        import numpy as np
         results = []
         for t in texts:
             enc = tokenizer(str(t), return_tensors="pt", truncation=True, max_length=512, padding=True)
             with torch.no_grad():
                 p = torch.nn.functional.softmax(model(**enc).logits, dim=-1)[0].tolist()
-            results.append([p[0], p[1]])                  # [benign, injection]
+            results.append([p[0], p[1]])
         return np.array(results, dtype=float)
     return predict
 
 
 def _make_deepfake_predict(model, processor):
-    """
-    ViTForImageClassification — prithivMLmods/Deep-Fake-Detector-v2-Model
+    deepfake_idx = 0
+    realism_idx  = 1
 
-    config.json label mapping (confirmed correct via testing):
-        0 → Deepfake, 1 → Realism
-    Returns [authentic_prob, deepfake_prob] — class_idx=1 is the threat.
-    """
-    deepfake_idx = 0   # config.json: 0 = Deepfake
-    realism_idx  = 1   # config.json: 1 = Realism
-
-    def predict(images: List[Image.Image]) -> np.ndarray:
+    def predict(images):
+        import torch
+        import numpy as np
+        from PIL import Image
         results = []
         with torch.no_grad():
             for img in images:
@@ -208,17 +210,9 @@ def _make_deepfake_predict(model, processor):
 
 
 def _make_audio_predict(model, extractor, target_sr: int = _AUDIO_TARGET_SR):
-    """
-    Wav2Vec2ForSequenceClassification —
-    Gustking/wav2vec2-large-xlsr-deepfake-audio-classification
-
-    Expected label mapping (verify against model config.json at load time):
-        0 → real  (authentic speech)
-        1 → fake  (AI-generated / voice-cloned)
-
-    Returns [real_prob, fake_prob] — class_idx=1 is the threat.
-    """
-    def predict(waveforms: List[np.ndarray]) -> np.ndarray:
+    def predict(waveforms):
+        import torch
+        import numpy as np
         results = []
         with torch.no_grad():
             for wav in waveforms:
@@ -232,7 +226,6 @@ def _make_audio_predict(model, extractor, target_sr: int = _AUDIO_TARGET_SR):
                 )
                 logits = model(**inputs).logits
                 probs  = torch.softmax(logits[0], dim=0).tolist()
-                # probs[0] = real, probs[1] = fake
                 results.append([probs[0], probs[1]])
         return np.array(results, dtype=float)
 
@@ -240,13 +233,14 @@ def _make_audio_predict(model, extractor, target_sr: int = _AUDIO_TARGET_SR):
 
 
 # ─────────────────────────────────────────────────────────────
-# INIT FUNCTIONS
+# INIT FUNCTIONS  (lazy: each runs only on first call)
 # ─────────────────────────────────────────────────────────────
 
 def init_phishing_explainer(tokenizer, model):
     global _phishing_predict_fn, _phishing_base_value
     if _phishing_predict_fn is not None:
         return
+    import numpy as np
     print("Initializing phishing SHAP explainer...")
     _phishing_predict_fn = _make_phishing_predict(tokenizer, model)
     bg_preds = _phishing_predict_fn(PHISHING_BACKGROUND)
@@ -258,6 +252,7 @@ def init_url_explainer(tokenizer, model):
     global _url_predict_fn, _url_base_value
     if _url_predict_fn is not None:
         return
+    import numpy as np
     print("Initializing URL SHAP explainer...")
     _url_predict_fn = _make_url_predict(tokenizer, model)
     bg_preds = _url_predict_fn(URL_BACKGROUND)
@@ -269,6 +264,7 @@ def init_prompt_injection_explainer(tokenizer, model):
     global _prompt_inj_predict_fn, _prompt_inj_base_value
     if _prompt_inj_predict_fn is not None:
         return
+    import numpy as np
     print("Initializing prompt injection SHAP explainer...")
     _prompt_inj_predict_fn = _make_prompt_inj_predict(tokenizer, model)
     bg_preds = _prompt_inj_predict_fn(PROMPT_INJECTION_BACKGROUND)
@@ -280,6 +276,8 @@ def init_deepfake_explainer(model, processor):
     global _deepfake_predict_fn, _deepfake_base_value
     if _deepfake_predict_fn is not None:
         return
+    import numpy as np
+    from PIL import Image
     print("Initializing image deepfake SHAP explainer...")
     _deepfake_predict_fn = _make_deepfake_predict(model, processor)
     bg_images = [
@@ -291,21 +289,13 @@ def init_deepfake_explainer(model, processor):
     print(f"Image deepfake SHAP ready. Base value: {_deepfake_base_value:.4f}")
 
 
-def init_audio_explainer(
-    model: Wav2Vec2ForSequenceClassification,
-    extractor: Wav2Vec2FeatureExtractor,
-    target_sr: int = _AUDIO_TARGET_SR,
-):
-    """
-    Initialize the audio deepfake predict function and compute the baseline
-    fake-probability from silent background clips.
-    """
+def init_audio_explainer(model, extractor, target_sr: int = _AUDIO_TARGET_SR):
     global _audio_predict_fn, _audio_base_value
     if _audio_predict_fn is not None:
         return
+    import numpy as np
     print("Initializing audio deepfake SHAP explainer...")
     _audio_predict_fn = _make_audio_predict(model, extractor, target_sr)
-    # Background: N silent clips of 2 s
     bg_clips = [np.zeros(target_sr * 2, dtype=np.float32) for _ in range(_AUDIO_BG_CLIPS)]
     bg_preds = _audio_predict_fn(bg_clips)
     _audio_base_value = float(np.mean(bg_preds[:, 1]))
@@ -316,7 +306,8 @@ def init_audio_explainer(
 # SHAP SHAPE NORMALIZER
 # ─────────────────────────────────────────────────────────────
 
-def _extract_class1_shap(shap_vals: any, class_idx: int = 1) -> np.ndarray:
+def _extract_class1_shap(shap_vals: any, class_idx: int = 1):
+    import numpy as np
     sv = np.array(shap_vals)
     if sv.ndim == 3 and sv.shape[0] == 1:   return sv[0, :, class_idx]
     elif sv.ndim == 3:                        return sv[class_idx].flatten()
@@ -333,6 +324,8 @@ def explain_phishing_input(text: str) -> dict:
     if _phishing_predict_fn is None or _phishing_base_value is None:
         return {"error": "Phishing SHAP explainer not initialized."}
     try:
+        import shap
+        import numpy as np
         bg_preds      = _phishing_predict_fn(PHISHING_BACKGROUND)
         input_pred    = _phishing_predict_fn([text])
         prob_phishing = float(input_pred[0, 1])
@@ -385,6 +378,8 @@ def explain_url_input(domain: str) -> dict:
     if _url_predict_fn is None or _url_base_value is None:
         return {"error": "URL SHAP explainer not initialized."}
     try:
+        import shap
+        import numpy as np
         bg_preds   = _url_predict_fn(URL_BACKGROUND)
         input_pred = _url_predict_fn([domain])
         prob_mal   = float(input_pred[0, 1])
@@ -436,6 +431,8 @@ def explain_prompt_injection_input(text: str) -> dict:
     if _prompt_inj_predict_fn is None or _prompt_inj_base_value is None:
         return {"error": "Prompt injection SHAP explainer not initialized."}
     try:
+        import shap
+        import numpy as np
         bg_preds   = _prompt_inj_predict_fn(PROMPT_INJECTION_BACKGROUND)
         input_pred = _prompt_inj_predict_fn([text])
         prob_inj   = float(input_pred[0, 1])
@@ -485,7 +482,7 @@ def explain_prompt_injection_input(text: str) -> dict:
                 "interpretation": "The injection check could not be completed. Do not forward this input to any AI system until reviewed."}
 
 
-def explain_deepfake_input(image: Image.Image) -> Tuple[float, float, str]:
+def explain_deepfake_input(image) -> Tuple[float, float, str]:
     """
     Run image deepfake detection on a single PIL image.
     Returns: (deepfake_prob, confidence, label)
@@ -493,7 +490,7 @@ def explain_deepfake_input(image: Image.Image) -> Tuple[float, float, str]:
     if _deepfake_predict_fn is None or _deepfake_base_value is None:
         raise ValueError("Image deepfake explainer not initialized.")
     try:
-        result        = _deepfake_predict_fn([image])      # (1, 2)
+        result        = _deepfake_predict_fn([image])
         deepfake_prob = float(result[0, 1])
         confidence    = abs(deepfake_prob - _deepfake_base_value)
         label         = "Deepfake" if deepfake_prob > 0.5 else "Realism"
@@ -503,18 +500,15 @@ def explain_deepfake_input(image: Image.Image) -> Tuple[float, float, str]:
         return 0.0, 0.0, "Realism"
 
 
-def explain_audio_input(waveform: np.ndarray) -> Tuple[float, float, str]:
+def explain_audio_input(waveform) -> Tuple[float, float, str]:
     """
     Run audio deepfake detection on a 16 kHz mono float32 numpy waveform.
     Returns: (deepfake_prob, confidence, label)
-      - deepfake_prob : probability the audio is AI-generated / voice-cloned
-      - confidence    : absolute deviation from the silent-clip baseline
-      - label         : 'Fake' | 'Real'
     """
     if _audio_predict_fn is None or _audio_base_value is None:
         raise ValueError("Audio deepfake explainer not initialized.")
     try:
-        result        = _audio_predict_fn([waveform])   # (1, 2)
+        result        = _audio_predict_fn([waveform])
         deepfake_prob = float(result[0, 1])
         confidence    = abs(deepfake_prob - _audio_base_value)
         label         = "Fake" if deepfake_prob > 0.5 else "Real"
@@ -568,17 +562,12 @@ def _threat_level(score: float) -> str:
 
 
 def _build_threat_context(alert_types: list, timeline: list) -> str:
-    """
-    Builds a specific, threat-type-aware context block for the Groq prompt.
-    Each alert type gets its own tailored description of what is at stake,
-    what the attacker is actually after, and what concrete steps to take.
-    """
     blocks = []
 
-    phishing_details      = [t for t in timeline if t.get("alert_type") == "phishing"]
-    url_details           = [t for t in timeline if t.get("alert_type") == "url"]
-    injection_details     = [t for t in timeline if t.get("alert_type") == "prompt_injection"]
-    deepfake_details      = [t for t in timeline if t.get("alert_type") == "deepfake"]
+    phishing_details       = [t for t in timeline if t.get("alert_type") == "phishing"]
+    url_details            = [t for t in timeline if t.get("alert_type") == "url"]
+    injection_details      = [t for t in timeline if t.get("alert_type") == "prompt_injection"]
+    deepfake_details       = [t for t in timeline if t.get("alert_type") == "deepfake"]
     audio_deepfake_details = [t for t in timeline if t.get("alert_type") == "audio_deepfake"]
 
     if phishing_details:
@@ -750,6 +739,7 @@ def generate_narrative(analysis: dict) -> dict:
     )
 
     try:
+        groq_client = _get_groq_client()
         response = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
@@ -805,13 +795,13 @@ def push_alert(alert: AlertInput) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 FEATURE_WEIGHTS = {
-    "velocity":          0.05,   # low — burst of 2 alerts ≠ campaign
+    "velocity":          0.05,
     "severity_trend":    0.10,
     "kill_chain_depth":  0.15,
     "kill_chain_prog":   0.15,
     "unique_techniques": 0.10,
-    "recency_weight":    0.15,   # recent threats matter more
-    "peak_score":        0.30,   # dominant — one 0.99 alert should drive score
+    "recency_weight":    0.15,
+    "peak_score":        0.30,
 }
 
 SEV_NUM = {"LOW": 0.2, "MEDIUM": 0.45, "HIGH": 0.75, "CRITICAL": 1.0}
@@ -820,8 +810,6 @@ SEV_NUM = {"LOW": 0.2, "MEDIUM": 0.45, "HIGH": 0.75, "CRITICAL": 1.0}
 def _get_stage(mitre: Optional[str]) -> Optional[int]:
     if not mitre:
         return None
-    # Must use explicit None check — stage 0 (Recon) is falsy, so a plain
-    # `or` short-circuit would discard it and return None instead.
     result = MITRE_STAGE_ORDER.get(mitre)
     if result is not None:
         return result
@@ -885,9 +873,6 @@ def detect_kill_chain_stage(alerts: List[dict]) -> dict:
             "stage_path":           [],
             "stages_traversed":     [],
         }
-    # Use the stage of the most recent alert as 'current' so the tracker
-    # actually advances as new alerts arrive, rather than being stuck at
-    # the historical maximum.
     current   = stages[-1]
     predicted = min(current + 1, 7)
     return {
