@@ -364,18 +364,21 @@ def explain_phishing_input(text: str) -> dict:
             "shap_feature_legit":      round(shap_legit, 4),
             "shap_feature_threat":     round(shap_threat, 4),
             "interpretation": (
-                f"Model output {prob_phishing:.4f} vs baseline {_phishing_base_value:.4f} "
-                f"(deviation={deviation:+.4f}). "
-                + ("Strong phishing signal above baseline." if deviation > 0.20
-                   else "Moderate phishing signal."         if deviation > 0.05
-                   else "Close to baseline — low confidence phishing.")
+                "This email looks very likely to be a phishing attempt. "
+                "Do not click any links or open attachments — report it to IT immediately."
+                if deviation > 0.20 else
+                "This email has some suspicious characteristics. "
+                "Treat it with caution and verify the sender through a separate channel before taking any action."
+                if deviation > 0.05 else
+                "This email looks mostly normal, but stay cautious. "
+                "If anything feels off, confirm with the sender directly."
             ),
             "top_contrastive_samples": top_contrasts,
         }
     except Exception as e:
         return {"type": "phishing", "error": str(e), "mean_shap_value": None,
                 "base_value": round(_phishing_base_value, 4), "prediction_deviation": None,
-                "interpretation": "SHAP computation failed — see error field."}
+                "interpretation": "The phishing check could not be completed. Treat this email as suspicious until verified."}
 
 
 def explain_url_input(domain: str) -> dict:
@@ -413,18 +416,20 @@ def explain_url_input(domain: str) -> dict:
             "shap_feature_benign":     round(shap_benign, 4),
             "shap_feature_threat":     round(shap_threat, 4),
             "interpretation": (
-                f"Model output {prob_mal:.4f} vs baseline {_url_base_value:.4f} "
-                f"(deviation={deviation:+.4f}). "
-                + ("High malicious signal above baseline." if deviation > 0.20
-                   else "Moderate malicious signal."       if deviation > 0.05
-                   else "Close to baseline — low confidence malicious.")
+                "This link is highly likely to be dangerous — it may lead to a fake login page "
+                "or trigger a malware download. Do not visit it, and block it in your firewall immediately."
+                if deviation > 0.20 else
+                "This link looks suspicious. Avoid clicking it until your IT or security team has verified it."
+                if deviation > 0.05 else
+                "This link appears mostly safe, but double-check the destination before visiting, "
+                "especially if it arrived unexpectedly."
             ),
             "top_contrastive_samples": top_contrasts,
         }
     except Exception as e:
         return {"type": "url", "error": str(e), "mean_shap_value": None,
                 "base_value": round(_url_base_value, 4), "prediction_deviation": None,
-                "interpretation": "SHAP computation failed — see error field."}
+                "interpretation": "The link check could not be completed. Do not visit this URL until it has been verified."}
 
 
 def explain_prompt_injection_input(text: str) -> dict:
@@ -464,18 +469,20 @@ def explain_prompt_injection_input(text: str) -> dict:
             "shap_feature_threat":     round(shap_threat, 4),
             "detected_tactics":        injection_tactics,
             "interpretation": (
-                f"Model output {prob_inj:.4f} vs baseline {_prompt_inj_base_value:.4f} "
-                f"(deviation={deviation:+.4f}). "
-                + ("Strong injection signal — highly anomalous vs benign baseline." if deviation > 0.20
-                   else "Moderate injection signal — some adversarial patterns."    if deviation > 0.05
-                   else "Close to baseline — low-confidence injection signal.")
+                "This input appears to be a deliberate attempt to hijack your AI system. "
+                "It contains hidden instructions designed to override normal behaviour — block it immediately."
+                if deviation > 0.20 else
+                "This input has patterns that look like an attempt to manipulate the AI. "
+                "Review it carefully before letting it reach any AI system."
+                if deviation > 0.05 else
+                "This input looks like a normal request, but monitor for any unusual AI responses that follow."
             ),
             "top_contrastive_samples": top_contrasts,
         }
     except Exception as e:
         return {"type": "prompt_injection", "error": str(e), "mean_shap_value": None,
                 "base_value": round(_prompt_inj_base_value, 4), "prediction_deviation": None,
-                "interpretation": "SHAP computation failed — see error field."}
+                "interpretation": "The injection check could not be completed. Do not forward this input to any AI system until reviewed."}
 
 
 def explain_deepfake_input(image: Image.Image) -> Tuple[float, float, str]:
@@ -813,7 +820,12 @@ SEV_NUM = {"LOW": 0.2, "MEDIUM": 0.45, "HIGH": 0.75, "CRITICAL": 1.0}
 def _get_stage(mitre: Optional[str]) -> Optional[int]:
     if not mitre:
         return None
-    return MITRE_STAGE_ORDER.get(mitre) or MITRE_STAGE_ORDER.get(mitre.split(".")[0])
+    # Must use explicit None check — stage 0 (Recon) is falsy, so a plain
+    # `or` short-circuit would discard it and return None instead.
+    result = MITRE_STAGE_ORDER.get(mitre)
+    if result is not None:
+        return result
+    return MITRE_STAGE_ORDER.get(mitre.split(".")[0])
 
 
 def compute_temporal_features(alerts: List[dict], window_seconds: int) -> Dict[str, float]:
@@ -863,8 +875,20 @@ def compute_fused_score(features: Dict[str, float]) -> float:
 
 
 def detect_kill_chain_stage(alerts: List[dict]) -> dict:
-    stages    = [s for a in alerts for s in [_get_stage(a.get("mitre_technique"))] if s is not None]
-    current   = max(stages) if stages else 0
+    stages = [s for a in alerts for s in [_get_stage(a.get("mitre_technique"))] if s is not None]
+    if not stages:
+        return {
+            "current_stage_index":  0,
+            "current_stage_name":   MITRE_STAGE_NAMES[0],
+            "predicted_next_index": 1,
+            "predicted_next_name":  MITRE_STAGE_NAMES[1],
+            "stage_path":           [],
+            "stages_traversed":     [],
+        }
+    # Use the stage of the most recent alert as 'current' so the tracker
+    # actually advances as new alerts arrive, rather than being stuck at
+    # the historical maximum.
+    current   = stages[-1]
     predicted = min(current + 1, 7)
     return {
         "current_stage_index":  current,
@@ -873,6 +897,7 @@ def detect_kill_chain_stage(alerts: List[dict]) -> dict:
         "predicted_next_name":  MITRE_STAGE_NAMES[predicted],
         "stage_path":           sorted(set(stages)),
         "stages_traversed":     [MITRE_STAGE_NAMES[s] for s in sorted(set(stages))],
+        "highest_stage_reached": max(stages),
     }
 
 

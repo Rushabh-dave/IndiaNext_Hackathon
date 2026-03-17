@@ -1,12 +1,7 @@
 # main.py
 # ─────────────────────────────────────────────────────────────
 # AEGIS — Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 4b
-# v4.4 — Lazy / Background Model Loading
-#
-# All models load in a background thread AFTER uvicorn starts.
-# Server is immediately available at http://localhost:8000.
-# Endpoints return HTTP 503 with a clear message if their
-# model is still warming up — no hanging, no timeout.
+# v4.3 — Phishing + URL + Prompt Injection + Image Deepfake + Audio Deepfake
 #
 # Endpoints:
 #   POST /analyze/phishing          — phishing email detection + SHAP
@@ -18,225 +13,49 @@
 #   POST /analyze/temporal          — temporal fusion analysis
 #   GET  /alerts/window             — view current window
 #   DELETE /alerts/reset            — clear window
-#   GET  /health                    — includes per-model ready status
+#   GET  /health
 # ─────────────────────────────────────────────────────────────
 
-from __future__ import annotations
-
-import io
-import os
-import threading
-import time
-from contextlib import asynccontextmanager
-from typing import Optional
-from urllib.parse import urlparse
-
-import librosa
-import numpy as np
-import torch
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
 from pydantic import BaseModel, field_validator
 from transformers import (
-    AutoModelForSequenceClassification,
     AutoTokenizer,
+    AutoModelForSequenceClassification,
     ViTForImageClassification,
     ViTImageProcessor,
-    Wav2Vec2FeatureExtractor,
     Wav2Vec2ForSequenceClassification,
+    Wav2Vec2FeatureExtractor,
 )
+from urllib.parse import urlparse
+from typing import Optional
+from PIL import Image
+import torch
+import io
+import os
+import librosa
+import numpy as np
 
 from temporal_fusion import (
     AlertInput,
     TemporalAnalysisRequest,
-    alert_window,
-    explain_audio_input,
-    explain_deepfake_input,
-    explain_phishing_input,
-    explain_prompt_injection_input,
-    explain_url_input,
-    get_window_alerts,
-    init_audio_explainer,
-    init_deepfake_explainer,
-    init_phishing_explainer,
-    init_prompt_injection_explainer,
-    init_url_explainer,
     push_alert,
+    get_window_alerts,
     run_temporal_analysis,
+    alert_window,
+    init_phishing_explainer,
+    init_url_explainer,
+    init_prompt_injection_explainer,
+    init_deepfake_explainer,
+    init_audio_explainer,
+    explain_phishing_input,
+    explain_url_input,
+    explain_prompt_injection_input,
+    explain_deepfake_input,
+    explain_audio_input,
 )
 
-
-# ─────────────────────────────────────────────────────────────
-# MODEL REGISTRY
-# ─────────────────────────────────────────────────────────────
-# _models  : holds the live tokenizer/model objects after load
-# _ready   : per-model boolean flag, flipped True when load + SHAP init done
-# _errors  : stores any exception string if a model fails to load
-
-_models: dict = {}
-_ready: dict = {
-    "phishing":         False,
-    "url":              False,
-    "prompt_injection": False,
-    "deepfake_image":   False,
-    "deepfake_audio":   False,
-}
-_errors: dict = {}
-
-
-def _all_ready() -> bool:
-    return all(_ready.values())
-
-
-def _check_ready(model_key: str) -> None:
-    """Raise HTTP 503 if the requested model hasn't finished loading yet."""
-    if not _ready.get(model_key):
-        err = _errors.get(model_key)
-        detail = (
-            f"Model '{model_key}' failed to load: {err}"
-            if err else
-            f"Model '{model_key}' is still warming up — please retry in a moment."
-        )
-        raise HTTPException(status_code=503, detail=detail)
-
-
-# ─────────────────────────────────────────────────────────────
-# BACKGROUND MODEL LOADER
-# ─────────────────────────────────────────────────────────────
-
-def _load_all_models() -> None:
-    """
-    Runs in a daemon thread kicked off by the lifespan handler.
-    Each model is loaded sequentially. _ready[key] flips to True
-    the moment that model + its SHAP explainer are fully initialised,
-    so each endpoint becomes available independently.
-    """
-
-    # ── 1. Phishing ──────────────────────────────────────────
-    try:
-        print("[AEGIS] Loading phishing model...")
-        t0  = time.time()
-        tok = AutoTokenizer.from_pretrained(
-            "cybersectony/phishing-email-detection-distilbert_v2.1"
-        )
-        mdl = AutoModelForSequenceClassification.from_pretrained(
-            "cybersectony/phishing-email-detection-distilbert_v2.1"
-        )
-        mdl.eval()
-        _models["phishing_tokenizer"] = tok
-        _models["phishing_model"]     = mdl
-        init_phishing_explainer(tok, mdl)
-        _ready["phishing"] = True
-        print(f"[AEGIS] ✅ Phishing ready ({time.time() - t0:.1f}s)")
-    except Exception as exc:
-        _errors["phishing"] = str(exc)
-        print(f"[AEGIS] ❌ Phishing failed: {exc}")
-
-    # ── 2. URL ───────────────────────────────────────────────
-    try:
-        print("[AEGIS] Loading URL model...")
-        t0  = time.time()
-        tok = AutoTokenizer.from_pretrained("kmack/malicious-url-detection")
-        mdl = AutoModelForSequenceClassification.from_pretrained(
-            "kmack/malicious-url-detection"
-        )
-        mdl.eval()
-        _models["url_tokenizer"] = tok
-        _models["url_model"]     = mdl
-        init_url_explainer(tok, mdl)
-        _ready["url"] = True
-        print(f"[AEGIS] ✅ URL ready ({time.time() - t0:.1f}s)")
-    except Exception as exc:
-        _errors["url"] = str(exc)
-        print(f"[AEGIS] ❌ URL failed: {exc}")
-
-    # ── 3. Prompt injection ──────────────────────────────────
-    try:
-        print("[AEGIS] Loading prompt injection model...")
-        t0  = time.time()
-        tok = AutoTokenizer.from_pretrained(
-            "protectai/deberta-v3-base-prompt-injection-v2"
-        )
-        mdl = AutoModelForSequenceClassification.from_pretrained(
-            "protectai/deberta-v3-base-prompt-injection-v2"
-        )
-        mdl.eval()
-        _models["prompt_inj_tokenizer"] = tok
-        _models["prompt_inj_model"]     = mdl
-        init_prompt_injection_explainer(tok, mdl)
-        _ready["prompt_injection"] = True
-        print(f"[AEGIS] ✅ Prompt injection ready ({time.time() - t0:.1f}s)")
-    except Exception as exc:
-        _errors["prompt_injection"] = str(exc)
-        print(f"[AEGIS] ❌ Prompt injection failed: {exc}")
-
-    # ── 4. Image deepfake ────────────────────────────────────
-    try:
-        print("[AEGIS] Loading image deepfake model...")
-        t0  = time.time()
-        mid = "prithivMLmods/Deep-Fake-Detector-v2-Model"
-        prc = ViTImageProcessor.from_pretrained(mid)
-        mdl = ViTForImageClassification.from_pretrained(mid)
-        mdl.eval()
-        _models["deepfake_processor"] = prc
-        _models["deepfake_model"]     = mdl
-        init_deepfake_explainer(mdl, prc)
-        _ready["deepfake_image"] = True
-        print(f"[AEGIS] ✅ Image deepfake ready ({time.time() - t0:.1f}s)")
-    except Exception as exc:
-        _errors["deepfake_image"] = str(exc)
-        print(f"[AEGIS] ❌ Image deepfake failed: {exc}")
-
-    # ── 5. Audio deepfake ────────────────────────────────────
-    try:
-        print("[AEGIS] Loading audio deepfake model...")
-        t0  = time.time()
-        mid = "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification"
-        ext = Wav2Vec2FeatureExtractor.from_pretrained(mid)
-        mdl = Wav2Vec2ForSequenceClassification.from_pretrained(mid)
-        mdl.eval()
-        _models["audio_extractor"]      = ext
-        _models["audio_deepfake_model"] = mdl
-        init_audio_explainer(mdl, ext)
-        _ready["deepfake_audio"] = True
-        print(f"[AEGIS] ✅ Audio deepfake ready ({time.time() - t0:.1f}s)")
-    except Exception as exc:
-        _errors["deepfake_audio"] = str(exc)
-        print(f"[AEGIS] ❌ Audio deepfake failed: {exc}")
-
-    if _all_ready():
-        print("[AEGIS] 🚀 All models loaded and ready.")
-    else:
-        print(f"[AEGIS] ⚠️  Finished loading with errors: {list(_errors.keys())}")
-
-
-# ─────────────────────────────────────────────────────────────
-# LIFESPAN — spins up the loader thread, yields, then exits
-# ─────────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(application: FastAPI):
-    loader = threading.Thread(
-        target=_load_all_models,
-        daemon=True,
-        name="aegis-model-loader",
-    )
-    loader.start()
-    print("[AEGIS] Server ready instantly. Models loading in background...")
-    yield
-    # Daemon thread dies automatically when the process exits
-
-
-# ─────────────────────────────────────────────────────────────
-# APP
-# ─────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="AEGIS Threat Detection",
-    version="4.4.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="AEGIS Threat Detection", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -244,6 +63,125 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ─────────────────────────────────────────────────────────────
+# LOAD MODELS + INIT SHAP AT STARTUP
+# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# LAZY MODEL REGISTRY
+#
+# Models are NOT loaded at startup. Each model loads on first use
+# and is cached for all subsequent requests. This means:
+#   - Server starts in ~1 second instead of 60-120 seconds
+#   - Only the models you actually call get loaded into memory
+#   - First request to each endpoint takes the usual load time;
+#     every request after that is instant (model is cached)
+#
+# Thread safety: threading.Lock() per model prevents two concurrent
+# first-requests from double-loading the same model.
+# ─────────────────────────────────────────────────────────────
+
+import threading
+
+_PHISHING_MODEL_ID  = "cybersectony/phishing-email-detection-distilbert_v2.1"
+_URL_MODEL_ID       = "kmack/malicious-url-detection"
+_PROMPT_INJ_ID      = "protectai/deberta-v3-base-prompt-injection-v2"
+_DEEPFAKE_IMAGE_ID  = "prithivMLmods/Deep-Fake-Detector-v2-Model"
+_DEEPFAKE_AUDIO_ID  = "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification"
+
+# One lock per model — prevents double-loading under concurrent requests
+_phishing_lock    = threading.Lock()
+_url_lock         = threading.Lock()
+_prompt_inj_lock  = threading.Lock()
+_deepfake_lock    = threading.Lock()
+_audio_lock       = threading.Lock()
+
+# Cached instances (None = not yet loaded)
+_phishing_tokenizer    = None
+_phishing_model        = None
+_url_tokenizer         = None
+_url_model             = None
+_prompt_inj_tokenizer  = None
+_prompt_inj_model      = None
+_deepfake_processor    = None
+_deepfake_model        = None
+_audio_extractor       = None
+_audio_deepfake_model  = None
+
+
+def _get_phishing():
+    global _phishing_tokenizer, _phishing_model
+    if _phishing_model is None:
+        with _phishing_lock:
+            if _phishing_model is None:
+                print("Lazy-loading phishing model...")
+                _phishing_tokenizer = AutoTokenizer.from_pretrained(_PHISHING_MODEL_ID)
+                _phishing_model = AutoModelForSequenceClassification.from_pretrained(_PHISHING_MODEL_ID)
+                _phishing_model.eval()
+                init_phishing_explainer(_phishing_tokenizer, _phishing_model)
+                print("Phishing model ready.")
+    return _phishing_tokenizer, _phishing_model
+
+
+def _get_url():
+    global _url_tokenizer, _url_model
+    if _url_model is None:
+        with _url_lock:
+            if _url_model is None:
+                print("Lazy-loading URL model...")
+                _url_tokenizer = AutoTokenizer.from_pretrained(_URL_MODEL_ID)
+                _url_model = AutoModelForSequenceClassification.from_pretrained(_URL_MODEL_ID)
+                _url_model.eval()
+                init_url_explainer(_url_tokenizer, _url_model)
+                print("URL model ready.")
+    return _url_tokenizer, _url_model
+
+
+def _get_prompt_inj():
+    global _prompt_inj_tokenizer, _prompt_inj_model
+    if _prompt_inj_model is None:
+        with _prompt_inj_lock:
+            if _prompt_inj_model is None:
+                print("Lazy-loading prompt injection model...")
+                _prompt_inj_tokenizer = AutoTokenizer.from_pretrained(_PROMPT_INJ_ID)
+                _prompt_inj_model = AutoModelForSequenceClassification.from_pretrained(_PROMPT_INJ_ID)
+                _prompt_inj_model.eval()
+                init_prompt_injection_explainer(_prompt_inj_tokenizer, _prompt_inj_model)
+                print("Prompt injection model ready.")
+    return _prompt_inj_tokenizer, _prompt_inj_model
+
+
+def _get_deepfake():
+    global _deepfake_processor, _deepfake_model
+    if _deepfake_model is None:
+        with _deepfake_lock:
+            if _deepfake_model is None:
+                print("Lazy-loading image deepfake model...")
+                _deepfake_processor = ViTImageProcessor.from_pretrained(_DEEPFAKE_IMAGE_ID)
+                _deepfake_model = ViTForImageClassification.from_pretrained(_DEEPFAKE_IMAGE_ID)
+                _deepfake_model.eval()
+                init_deepfake_explainer(_deepfake_model, _deepfake_processor)
+                print("Image deepfake model ready.")
+    return _deepfake_processor, _deepfake_model
+
+
+def _get_audio():
+    global _audio_extractor, _audio_deepfake_model
+    if _audio_deepfake_model is None:
+        with _audio_lock:
+            if _audio_deepfake_model is None:
+                print("Lazy-loading audio deepfake model...")
+                _audio_extractor = Wav2Vec2FeatureExtractor.from_pretrained(_DEEPFAKE_AUDIO_ID)
+                _audio_deepfake_model = Wav2Vec2ForSequenceClassification.from_pretrained(_DEEPFAKE_AUDIO_ID)
+                _audio_deepfake_model.eval()
+                init_audio_explainer(_audio_deepfake_model, _audio_extractor)
+                print("Audio deepfake model ready.")
+    return _audio_extractor, _audio_deepfake_model
+
+
+print("✅ AEGIS server starting (models load on first use)...")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -338,17 +276,131 @@ def severity_from_score(score: float) -> str:
     return "LOW"
 
 
+def _window_alert_types() -> set:
+    """Return the set of alert_types currently in the sliding window."""
+    return {a["alert_type"] for a in get_window_alerts()}
+
+
+def _window_max_stage() -> int:
+    """
+    Return the highest kill-chain stage index already recorded in the
+    current alert window.  Used to escalate MITRE technique assignment
+    when the attacker has already been seen at an earlier stage.
+    """
+    from temporal_fusion import MITRE_STAGE_ORDER
+    stages = []
+    for a in get_window_alerts():
+        mt = a.get("mitre_technique")
+        if mt:
+            s = MITRE_STAGE_ORDER.get(mt) or MITRE_STAGE_ORDER.get(mt.split(".")[0])
+            if s is not None:
+                stages.append(s)
+    return max(stages) if stages else -1
+
+
+# ─────────────────────────────────────────────────────────────
+# DYNAMIC MITRE TECHNIQUE ASSIGNMENT
+#
+# Each detector now picks its MITRE technique based on two signals:
+#   1. threat_score  — how confident the model is
+#   2. window context — what stages have already been seen
+#
+# This lets the kill chain advance naturally as the attacker
+# progresses, instead of being frozen at the hardcoded stage.
+#
+# Kill-chain stage map (for reference):
+#   0 Recon | 1 Initial Access | 2 Execution | 3 Persistence
+#   4 Privilege Escalation | 5 Lateral Movement | 6 Collection
+#   7 Exfiltration/Impact
+# ─────────────────────────────────────────────────────────────
+
+def mitre_for_phishing(threat_score: float) -> str:
+    """
+    Phishing starts at Initial Access (stage 1).
+    High-confidence repeated phishing can indicate Execution-stage
+    credential harvesting (T1078 — Valid Accounts) when the attacker
+    has already achieved initial access.
+    """
+    seen_types  = _window_alert_types()
+    max_stage   = _window_max_stage()
+
+    if max_stage >= 1 and threat_score >= 0.85:
+        # Attacker already inside; this phishing is now credential abuse
+        return "T1078"          # stage 2 — Execution / Valid Accounts
+    return "T1566.001"          # stage 1 — Initial Access / Spearphishing Attachment
+
+
+def mitre_for_url(threat_score: float) -> str:
+    """
+    Malicious URLs start at Initial Access (stage 1 — T1566.002).
+    A high-score URL after initial access has been established likely
+    represents a C2 callback or lateral movement link.
+    """
+    max_stage = _window_max_stage()
+
+    if max_stage >= 3 and threat_score >= 0.65:
+        return "T1021"          # stage 5 — Lateral Movement / Remote Services
+    if max_stage >= 2 and threat_score >= 0.65:
+        return "T1055"          # stage 3 — Persistence / Process Injection via URL
+    if max_stage >= 1 and threat_score >= 0.85:
+        return "T1059"          # stage 2 — Execution (drive-by / malicious link exec)
+    return "T1566.002"          # stage 1 — Initial Access / Spearphishing Link
+
+
+def mitre_for_prompt_injection(threat_score: float) -> str:
+    """
+    Prompt injection starts at Execution (stage 2 — T1059.PI).
+    A confirmed injection after the attacker has persisted can be
+    used for data Collection or Exfiltration.
+    """
+    max_stage = _window_max_stage()
+
+    if max_stage >= 4 and threat_score >= 0.65:
+        return "T1005"          # stage 6 — Collection / Data from Local System
+    if max_stage >= 3 and threat_score >= 0.65:
+        return "T1547"          # stage 3 — Persistence (AI system config backdoor)
+    return "T1059.PI"           # stage 2 — Execution / Prompt Injection
+
+
+def mitre_for_deepfake_image(threat_score: float) -> str:
+    """
+    Image deepfakes start as Initial Access impersonation (T1656, stage 1).
+    High-confidence deepfakes seen after execution/persistence represent
+    active Privilege Escalation via identity fraud.
+    """
+    max_stage = _window_max_stage()
+
+    if max_stage >= 3 and threat_score >= 0.75:
+        return "T1548"          # stage 4 — Privilege Escalation / Abuse Elevation
+    if max_stage >= 2 and threat_score >= 0.65:
+        return "T1078"          # stage 2 — Execution / Valid Accounts (identity abuse)
+    return "T1656"              # stage 1 — Initial Access / Impersonation
+
+
+def mitre_for_deepfake_audio(threat_score: float) -> str:
+    """
+    Audio deepfakes start as Initial Access impersonation (T1656, stage 1).
+    A voice-clone after privilege escalation is likely being used for
+    social engineering to authorize data exfiltration or wire transfers.
+    """
+    max_stage = _window_max_stage()
+
+    if max_stage >= 5 and threat_score >= 0.75:
+        return "T1041"          # stage 7 — Exfiltration / Exfil over C2 Channel
+    if max_stage >= 4 and threat_score >= 0.65:
+        return "T1534"          # stage 5 — Lateral Movement / Internal Spearphishing
+    if max_stage >= 2 and threat_score >= 0.65:
+        return "T1548"          # stage 4 — Privilege Escalation (voice-auth bypass)
+    return "T1656"              # stage 1 — Initial Access / Impersonation
+
+
 # ─────────────────────────────────────────────────────────────
 # ENDPOINT 1 — POST /analyze/phishing
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze/phishing")
 def analyze_phishing(body: PhishingEmailInput):
-    _check_ready("phishing")
-
-    tok   = _models["phishing_tokenizer"]
-    model = _models["phishing_model"]
-
+    tok, model = _get_phishing()
     full_text = (f"Subject: {body.subject}\n\n" if body.subject else "") + body.body
 
     inputs = tok(full_text, return_tensors="pt", truncation=True, max_length=512)
@@ -368,7 +420,7 @@ def analyze_phishing(body: PhishingEmailInput):
     severity  = severity_from_score(phishing_combined)
 
     found_keywords = [kw for kw in PHISHING_KEYWORDS if kw.lower() in full_text.lower()]
-    explanation = (
+    explanation    = (
         f"Flagged as phishing ({phishing_combined * 100:.1f}% confidence). "
         + (f"Patterns found: {', '.join(repr(k) for k in found_keywords[:5])}. " if found_keywords else "")
         + "Do not click any links."
@@ -376,6 +428,7 @@ def analyze_phishing(body: PhishingEmailInput):
         f"Appears legitimate ({scores['legitimate_email'] * 100:.1f}% confidence). No phishing patterns detected."
     )
 
+    mitre = mitre_for_phishing(phishing_combined) if is_threat else None
     result = {
         "verdict":            verdict,
         "severity":           severity,
@@ -384,7 +437,7 @@ def analyze_phishing(body: PhishingEmailInput):
         "all_scores":         scores,
         "sender_analysis":    check_sender_domain(body.sender) if body.sender else ["Sender address looks clean"],
         "explanation":        explanation,
-        "mitre_technique":    "T1566.001 - Spearphishing Attachment" if is_threat else None,
+        "mitre_technique":    f"{mitre} - Spearphishing Attachment" if mitre else None,
         "recommended_action": (
             "Do not click any links. Report to your security team. Delete the email immediately."
             if is_threat else "No action required."
@@ -398,7 +451,7 @@ def analyze_phishing(body: PhishingEmailInput):
             alert_type      = "phishing",
             threat_score    = round(phishing_combined, 4),
             severity        = severity,
-            mitre_technique = "T1566.001",
+            mitre_technique = mitre,
             detail          = {"verdict": verdict, "top_label": top_label, "shap": shap_result},
         ))
         result["ingested_to_window"] = True
@@ -412,10 +465,7 @@ def analyze_phishing(body: PhishingEmailInput):
 
 @app.post("/analyze/url")
 def analyze_url(body: TextInput):
-    _check_ready("url")
-
-    tok    = _models["url_tokenizer"]
-    model  = _models["url_model"]
+    tok, model = _get_url()
     domain = extract_domain(body.text)
 
     inputs = tok(domain, return_tensors="pt", truncation=True, padding=True, max_length=128)
@@ -431,7 +481,7 @@ def analyze_url(body: TextInput):
     severity     = severity_from_score(threat_score)
 
     found_patterns = [p for p in URL_SUSPICIOUS_PATTERNS if p.lower() in body.text.lower()]
-    explanation = (
+    explanation    = (
         f"Domain '{domain}' classified malicious ({threat_score * 100:.1f}% confidence). "
         + (f"Suspicious patterns: {', '.join(repr(p) for p in found_patterns[:4])}. " if found_patterns else "")
         + "Do not visit this URL."
@@ -439,6 +489,7 @@ def analyze_url(body: TextInput):
         f"Domain '{domain}' appears benign ({scores['benign'] * 100:.1f}% confidence). No malicious patterns detected."
     )
 
+    mitre = mitre_for_url(threat_score) if is_threat else None
     result = {
         "verdict":            verdict,
         "severity":           severity,
@@ -447,7 +498,7 @@ def analyze_url(body: TextInput):
         "original_url":       body.text,
         "all_scores":         scores,
         "explanation":        explanation,
-        "mitre_technique":    "T1566.002 - Spearphishing Link" if is_threat else None,
+        "mitre_technique":    f"{mitre} - Spearphishing Link" if mitre else None,
         "recommended_action": (
             "Do not visit this URL. Block the domain in your firewall. Report to your security team."
             if is_threat else "URL appears safe to visit."
@@ -461,7 +512,7 @@ def analyze_url(body: TextInput):
             alert_type      = "url",
             threat_score    = round(threat_score, 4),
             severity        = severity,
-            mitre_technique = "T1566.002",
+            mitre_technique = mitre,
             detail          = {"domain": domain, "original_url": body.text, "shap": shap_result},
         ))
         result["ingested_to_window"] = True
@@ -475,16 +526,15 @@ def analyze_url(body: TextInput):
 
 @app.post("/analyze/prompt-injection")
 def analyze_prompt_injection(body: PromptInjectionInput):
-    _check_ready("prompt_injection")
-
-    tok   = _models["prompt_inj_tokenizer"]
-    model = _models["prompt_inj_model"]
-
-    inputs = tok(body.text, return_tensors="pt", truncation=True, max_length=512, padding=True)
+    tok, model = _get_prompt_inj()
+    inputs = tok(
+        body.text, return_tensors="pt", truncation=True, max_length=512, padding=True
+    )
     with torch.no_grad():
         probs = torch.nn.functional.softmax(model(**inputs).logits, dim=-1)
 
     raw_probs = probs[0].tolist()
+    # label 0 = BENIGN, label 1 = INJECTION (per protectai model card)
     scores = {
         "injection":  round(raw_probs[1], 4),
         "legitimate": round(raw_probs[0], 4),
@@ -503,13 +553,14 @@ def analyze_prompt_injection(body: PromptInjectionInput):
         "No injection patterns detected."
     )
 
+    mitre = mitre_for_prompt_injection(threat_score) if is_threat else None
     result = {
         "verdict":            verdict,
         "severity":           severity,
         "threat_score":       round(threat_score, 4),
         "all_scores":         scores,
         "explanation":        explanation,
-        "mitre_technique":    "T1059.PI - Prompt Injection" if is_threat else None,
+        "mitre_technique":    f"{mitre} - Prompt Injection" if mitre else None,
         "recommended_action": (
             "Block this input. Do NOT pass it to an LLM. Log the source and escalate to your AI security team."
             if is_threat else "Input appears safe to pass to the LLM."
@@ -523,7 +574,7 @@ def analyze_prompt_injection(body: PromptInjectionInput):
             alert_type      = "prompt_injection",
             threat_score    = round(threat_score, 4),
             severity        = severity,
-            mitre_technique = "T1059.PI",
+            mitre_technique = mitre,
             detail          = {
                 "detected_tactics": shap_result.get("detected_tactics", []),
                 "shap":             shap_result,
@@ -535,7 +586,7 @@ def analyze_prompt_injection(body: PromptInjectionInput):
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 4 — POST /analyze/deepfake  (IMAGE)
+# ENDPOINT 4 — POST /analyze/deepfake  (IMAGE only)
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze/deepfake")
@@ -543,17 +594,15 @@ async def analyze_deepfake(file: UploadFile = File(...)):
     """
     Analyze a single IMAGE for deepfake detection.
     Accepts: jpg, jpeg, png, webp, bmp
-    Model: prithivMLmods/Deep-Fake-Detector-v2-Model (ViT)
+    Model: prithivMLmods/Deep-Fake-Detector-v2-Model (ViT, 92% accuracy)
     Labels: 'Realism' (authentic) | 'Deepfake' (manipulated)
     """
-    _check_ready("deepfake_image")
-
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
     file_ext = os.path.splitext(file.filename or "")[-1].lower()
 
     if file_ext not in valid_extensions:
         return {
-            "error":    f"Invalid file type '{file_ext}'. Supported: {', '.join(valid_extensions)}",
+            "error": f"Invalid file type '{file_ext}'. Supported: {', '.join(valid_extensions)}",
             "filename": file.filename,
         }
 
@@ -563,6 +612,7 @@ async def analyze_deepfake(file: UploadFile = File(...)):
     except Exception as e:
         return {"error": f"Cannot open image: {str(e)}", "filename": file.filename}
 
+    _get_deepfake()  # ensure model + SHAP explainer are loaded
     deepfake_score, confidence, label = explain_deepfake_input(image)
 
     is_threat = label == "Deepfake"
@@ -577,6 +627,7 @@ async def analyze_deepfake(file: UploadFile = File(...)):
         "No deepfake indicators detected."
     )
 
+    mitre = mitre_for_deepfake_image(deepfake_score) if is_threat else None
     result = {
         "verdict":            verdict,
         "severity":           severity,
@@ -585,7 +636,7 @@ async def analyze_deepfake(file: UploadFile = File(...)):
         "predicted_label":    label,
         "filename":           file.filename,
         "explanation":        explanation,
-        "mitre_technique":    "T1656 - Impersonation (Deepfake)" if is_threat else None,
+        "mitre_technique":    f"{mitre} - Impersonation (Deepfake)" if mitre else None,
         "recommended_action": (
             "Do not share or use this image. Verify from original sources."
             if is_threat else "Image appears to be authentic."
@@ -600,7 +651,8 @@ async def analyze_deepfake(file: UploadFile = File(...)):
             "predicted_label":     label,
             "interpretation": (
                 f"ViT model detected {deepfake_score * 100:.1f}% probability of deepfake. "
-                "Indicators may include facial inconsistencies, unnatural textures, or blending artifacts."
+                "Indicators may include facial inconsistencies, unnatural textures, "
+                "or blending artifacts."
             ),
         }
         result["shap"] = shap_result
@@ -608,7 +660,7 @@ async def analyze_deepfake(file: UploadFile = File(...)):
             alert_type      = "deepfake",
             threat_score    = round(deepfake_score, 4),
             severity        = severity,
-            mitre_technique = "T1656",
+            mitre_technique = mitre,
             detail          = {"verdict": verdict, "filename": file.filename, "shap": shap_result},
         ))
         result["ingested_to_window"] = True
@@ -617,7 +669,7 @@ async def analyze_deepfake(file: UploadFile = File(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 4b — POST /analyze/deepfake-audio  (AUDIO)
+# ENDPOINT 4b — POST /analyze/deepfake-audio  (AUDIO only)
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze/deepfake-audio")
@@ -629,8 +681,6 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
     Labels  : 'Real' (authentic) | 'Fake' (AI-generated / voice-cloned)
     Notes   : Audio is resampled to 16 kHz mono. Files >30 s are truncated.
     """
-    _check_ready("deepfake_audio")
-
     TARGET_SR = 16_000
     MAX_SECS  = 30
 
@@ -644,9 +694,9 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
         }
 
     try:
-        content  = await file.read()
-        wav_buf  = io.BytesIO(content)
-        waveform, _ = librosa.load(wav_buf, sr=TARGET_SR, mono=True)
+        content = await file.read()
+        wav_buf = io.BytesIO(content)
+        waveform, sr = librosa.load(wav_buf, sr=TARGET_SR, mono=True)
     except Exception as e:
         return {"error": f"Cannot decode audio: {str(e)}", "filename": file.filename}
 
@@ -657,6 +707,7 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
     duration_secs = round(len(waveform) / TARGET_SR, 2)
 
     try:
+        _get_audio()  # ensure model + SHAP explainer are loaded
         deepfake_score, confidence, label = explain_audio_input(waveform)
     except Exception as e:
         return {"error": f"Model inference failed: {str(e)}", "filename": file.filename}
@@ -673,6 +724,7 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
         "No synthetic speech indicators detected."
     )
 
+    mitre = mitre_for_deepfake_audio(deepfake_score) if is_threat else None
     result = {
         "verdict":            verdict,
         "severity":           severity,
@@ -683,11 +735,12 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
         "duration_seconds":   duration_secs,
         "sample_rate_used":   TARGET_SR,
         "explanation":        explanation,
-        "mitre_technique":    "T1656 - Impersonation (Audio Deepfake)" if is_threat else None,
+        "mitre_technique":    f"{mitre} - Impersonation (Audio Deepfake)" if mitre else None,
         "recommended_action": (
             "Do not trust or act on this audio. Verify via a live call to the claimed speaker. "
             "Preserve as evidence and escalate to your fraud/security team."
-            if is_threat else "Audio appears authentic."
+            if is_threat else
+            "Audio appears authentic."
         ),
     }
 
@@ -708,7 +761,7 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
             alert_type      = "audio_deepfake",
             threat_score    = round(deepfake_score, 4),
             severity        = severity,
-            mitre_technique = "T1656",
+            mitre_technique = mitre,
             detail          = {
                 "verdict":          verdict,
                 "filename":         file.filename,
@@ -774,23 +827,21 @@ def reset_window():
 @app.get("/health")
 def health():
     from temporal_fusion import (
-        _audio_base_value,
-        _deepfake_base_value,
         _phishing_base_value,
-        _prompt_inj_base_value,
         _url_base_value,
+        _prompt_inj_base_value,
+        _deepfake_base_value,
+        _audio_base_value,
     )
     return {
-        "status":       "ok" if _all_ready() else "warming_up",
-        "version":      "4.4.0",
-        "models_ready": _ready,
-        "load_errors":  _errors or None,
+        "status":  "ok",
+        "version": "4.3.0",
         "models": {
-            "phishing":         "cybersectony/phishing-email-detection-distilbert_v2.1",
-            "url":              "kmack/malicious-url-detection",
-            "prompt_injection": "protectai/deberta-v3-base-prompt-injection-v2",
-            "deepfake_image":   "prithivMLmods/Deep-Fake-Detector-v2-Model (ViT, image-only)",
-            "deepfake_audio":   "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification",
+            "phishing":         _PHISHING_MODEL_ID,
+            "url":              _URL_MODEL_ID,
+            "prompt_injection": _PROMPT_INJ_ID,
+            "deepfake_image":   _DEEPFAKE_IMAGE_ID + " (ViT, image-only)",
+            "deepfake_audio":   _DEEPFAKE_AUDIO_ID,
         },
         "shap": {
             "method":                "KernelExplainer on output-probability space",
@@ -805,5 +856,12 @@ def health():
         "temporal_window": {
             "active_alerts":  len(get_window_alerts()),
             "window_seconds": 300,
+        },
+        "models_loaded": {
+            "phishing":         _phishing_model is not None,
+            "url":              _url_model is not None,
+            "prompt_injection": _prompt_inj_model is not None,
+            "deepfake_image":   _deepfake_model is not None,
+            "deepfake_audio":   _audio_deepfake_model is not None,
         },
     }
