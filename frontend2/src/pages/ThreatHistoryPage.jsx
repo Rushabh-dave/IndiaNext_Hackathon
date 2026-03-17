@@ -26,7 +26,13 @@ export default function ThreatHistoryPage() {
         const data = await apiService.getAlertWindow();
         setAlerts(data.alerts || []);
       } catch (err) {
-        setError('Could not reach backend. Is the AEGIS server running on port 8000?');
+        let errorMsg = 'Could not reach backend. Please check that the AEGIS server is running.';
+        if (err?.detail) {
+          errorMsg = err.detail;
+        } else if (err?.message) {
+          errorMsg = err.message;
+        }
+        setError(errorMsg);
       } finally {
         setLoading(false);
       }

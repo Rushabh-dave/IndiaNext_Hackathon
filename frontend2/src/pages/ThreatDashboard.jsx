@@ -70,6 +70,8 @@ export default function ThreatDashboard() {
         setTemporalData(data);
       } catch (err) {
         console.error("Failed to fetch temporal analysis:", err);
+        // Set default temporal data on error instead of completely failing
+        setTemporalData(null);
       } finally {
         setIsTemporalLoading(false);
       }

@@ -25,8 +25,15 @@ export default function ImageScanner() {
       const result = normalizeResult(raw, 'Image');
       navigate('/dashboard', { state: { result, type: 'Deepfake Image', input: file.name } });
     } catch (err) {
-      const errMsg = err?.response?.data?.detail || err.message || 'Connection failed';
-      setError(`Analysis failed: ${errMsg}`);
+      let errorMsg = 'Analysis failed. Please try again.';
+      if (err?.detail) {
+        errorMsg = err.detail;
+      } else if (err?.response?.data?.detail) {
+        errorMsg = err.response.data.detail;
+      } else if (err?.message) {
+        errorMsg = err.message;
+      }
+      setError(`Analysis failed: ${errorMsg}`);
     } finally {
       setIsAnalyzing(false);
     }

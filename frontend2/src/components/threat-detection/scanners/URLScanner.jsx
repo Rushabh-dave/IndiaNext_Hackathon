@@ -22,8 +22,21 @@ export default function URLScanner() {
       const result = normalizeResult(raw, 'URL');
       navigate('/dashboard', { state: { result, type: 'Malicious URL', input: url, scanType: 'url' } });
     } catch (err) {
-      const errMsg = err?.response?.data?.detail || err.message || 'Connection failed';
-      setError(`Analysis failed: ${errMsg}`);
+      // Handle axios errors and custom error objects
+      let errorMsg = 'Analysis failed. Please try again.';
+      
+      if (err?.detail) {
+        // Custom error object from our interceptor
+        errorMsg = err.detail;
+      } else if (err?.response?.data?.detail) {
+        // Backend validation error
+        errorMsg = err.response.data.detail;
+      } else if (err?.message) {
+        // Network or other error
+        errorMsg = err.message;
+      }
+      
+      setError(`Analysis failed: ${errorMsg}`);
     } finally {
       setIsAnalyzing(false);
     }

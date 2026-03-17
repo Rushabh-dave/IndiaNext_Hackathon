@@ -2,10 +2,39 @@ import axios from 'axios';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
+console.log('[AEGIS] API Base URL:', API_BASE_URL);
+
 const api = axios.create({
   baseURL: API_BASE_URL,
   headers: { 'Content-Type': 'application/json' },
+  timeout: 60000, // 60 second timeout for heavy analysis
 });
+
+// ─── Error Interceptor ───────────────────────────────────────────────────────
+// Catches all axios errors and formats them for the frontend
+api.interceptors.response.use(
+  response => response,
+  error => {
+    // Format error in a way that normalizeResult can handle
+    const errorResponse = {
+      error: true,
+      detail: error.response?.data?.detail || error.message || 'Unknown error',
+      status: error.response?.status || null,
+    };
+
+    // Log error for debugging
+    console.error('[AEGIS API Error]', {
+      message: error.message,
+      status: error.response?.status,
+      url: error.config?.url,
+      baseURL: API_BASE_URL,
+      data: error.response?.data,
+    });
+
+    // Return error object so it reaches the catch block
+    return Promise.reject(errorResponse);
+  }
+);
 
 // ─── Raw API calls ───────────────────────────────────────────────────────────
 
@@ -79,16 +108,46 @@ export const apiService = {
 
 export function normalizeResult(raw, scanType) {
   if (!raw || raw.error) {
+    const errorDetail = raw?.detail || 'Unknown error';
+    const isNetworkError = !raw?.status || raw?.status === null;
+    
+    // Build helpful error message
+    let indicators = [];
+    let recommendations = '';
+    
+    if (isNetworkError) {
+      indicators = [
+        `Network Error: Could not reach backend at ${API_BASE_URL}`,
+        `Error details: ${errorDetail}`,
+      ];
+      recommendations = `Ensure the AEGIS backend is running and accessible at: ${API_BASE_URL}`;
+    } else if (raw?.status >= 500) {
+      indicators = [
+        `Server Error (${raw.status}): Backend encountered an error`,
+        `Error details: ${errorDetail}`,
+      ];
+      recommendations = 'The analysis server encountered an internal error. Check server logs.';
+    } else if (raw?.status >= 400) {
+      indicators = [
+        `Request Error (${raw.status}): ${errorDetail}`,
+        `Check your input format and try again.`,
+      ];
+      recommendations = 'Verify your input format and retry the analysis.';
+    } else {
+      indicators = [`Error: ${errorDetail}`];
+      recommendations = 'An unexpected error occurred. Please try again.';
+    }
+
     return {
       verdict: 'ERROR',
       severity: 'UNKNOWN',
       threat_score: 0,
       score: 0,
       confidence: 0,
-      threatName: 'Connection Error',
+      threatName: 'Analysis Error',
       isSafe: false,
-      indicators: ['Could not reach the analysis server. Is it running on port 8000?'],
-      recommendations: 'Check that the AEGIS backend is running: uvicorn main:app --port 8000',
+      indicators,
+      recommendations,
       mitre_technique: null,
       shap: null,
       raw,
