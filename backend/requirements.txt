@@ -1,37 +1,19 @@
-# AEGIS — requirements.txt v4.4
-# NOTE: torch and torchaudio are installed by the Dockerfile directly
-#       (CPU-only build) — do NOT add them here or they will reinstall
-#       the full CUDA version and break the build.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.0+cpu
+torchaudio==2.2.0+cpu
 
-# ── API Framework ──────────────────────────────────────────────
 fastapi
 uvicorn[standard]
 python-multipart
 python-dotenv
-
-# ── Data Validation ────────────────────────────────────────────
 pydantic
 pydantic[email]
-
-# ── Transformers (models loaded from HuggingFace) ──────────────
 transformers
-
-# ── Explainability ─────────────────────────────────────────────
 shap
-
-# ── AI Narrative Engine ────────────────────────────────────────
 groq
-
-# ── Anthropic SDK ──────────────────────────────────────────────
 anthropic
-
-# ── Image Processing ───────────────────────────────────────────
 pillow
-
-# ── Audio Processing ───────────────────────────────────────────
 librosa
 soundfile
-
-# ── Data & ML Utilities ────────────────────────────────────────
 numpy
 scikit-learn
