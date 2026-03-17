@@ -1,0 +1,29 @@
+# Dockerfile — AEGIS Threat Detection Backend v4.4
+# CPU-only torch to keep image size under Render free limits
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# System deps for librosa + soundfile (audio processing)
+RUN apt-get update && apt-get install -y \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CPU-only torch FIRST as its own layer
+# This layer gets cached by Docker — rebuilds after code changes are fast
+RUN pip install --no-cache-dir \
+    torch==2.2.0+cpu \
+    torchaudio==2.2.0+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Copy and install the rest of the requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all source files
+COPY . .
+
+# Render uses port 10000 by default
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]

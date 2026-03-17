@@ -1,14 +1,15 @@
 # main.py
 # ─────────────────────────────────────────────────────────────
 # AEGIS — Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 4b
-# v4.3 — Phishing + URL + Prompt Injection + Image Deepfake + Audio Deepfake
+# v4.4 — Phishing + URL + Prompt Injection + Image Deepfake + Audio Deepfake
+#         (lighter wav2vec2-base audio model for deployment)
 #
 # Endpoints:
 #   POST /analyze/phishing          — phishing email detection + SHAP
 #   POST /analyze/url               — malicious URL detection + SHAP
 #   POST /analyze/prompt-injection  — prompt injection detection + SHAP
 #   POST /analyze/deepfake          — deepfake IMAGE detection (ViT)
-#   POST /analyze/deepfake-audio    — deepfake AUDIO detection (wav2vec2)
+#   POST /analyze/deepfake-audio    — deepfake AUDIO detection (wav2vec2-base)
 #   POST /ingest/alert              — push alert into sliding window
 #   POST /analyze/temporal          — temporal fusion analysis
 #   GET  /alerts/window             — view current window
@@ -55,7 +56,7 @@ from temporal_fusion import (
     explain_audio_input,
 )
 
-app = FastAPI(title="AEGIS Threat Detection", version="4.3.0")
+app = FastAPI(title="AEGIS Threat Detection", version="4.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,21 +67,8 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────
-# LOAD MODELS + INIT SHAP AT STARTUP
-# ─────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────
 # LAZY MODEL REGISTRY
-#
-# Models are NOT loaded at startup. Each model loads on first use
-# and is cached for all subsequent requests. This means:
-#   - Server starts in ~1 second instead of 60-120 seconds
-#   - Only the models you actually call get loaded into memory
-#   - First request to each endpoint takes the usual load time;
-#     every request after that is instant (model is cached)
-#
-# Thread safety: threading.Lock() per model prevents two concurrent
-# first-requests from double-loading the same model.
+# Models load on first request, not at startup.
 # ─────────────────────────────────────────────────────────────
 
 import threading
@@ -89,16 +77,14 @@ _PHISHING_MODEL_ID  = "cybersectony/phishing-email-detection-distilbert_v2.1"
 _URL_MODEL_ID       = "kmack/malicious-url-detection"
 _PROMPT_INJ_ID      = "protectai/deberta-v3-base-prompt-injection-v2"
 _DEEPFAKE_IMAGE_ID  = "prithivMLmods/Deep-Fake-Detector-v2-Model"
-_DEEPFAKE_AUDIO_ID  = "Gustking/wav2vec2-large-xlsr-deepfake-audio-classification"
+_DEEPFAKE_AUDIO_ID  = "motheecreator/Deepfake-audio-detection"  # wav2vec2-base ~360MB (was xlsr ~1.2GB)
 
-# One lock per model — prevents double-loading under concurrent requests
 _phishing_lock    = threading.Lock()
 _url_lock         = threading.Lock()
 _prompt_inj_lock  = threading.Lock()
 _deepfake_lock    = threading.Lock()
 _audio_lock       = threading.Lock()
 
-# Cached instances (None = not yet loaded)
 _phishing_tokenizer    = None
 _phishing_model        = None
 _url_tokenizer         = None
@@ -181,7 +167,7 @@ def _get_audio():
     return _audio_extractor, _audio_deepfake_model
 
 
-print("✅ AEGIS server starting (models load on first use)...")
+print("✅ AEGIS v4.4 server starting (all 5 detectors, models load on first use)...")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -277,16 +263,10 @@ def severity_from_score(score: float) -> str:
 
 
 def _window_alert_types() -> set:
-    """Return the set of alert_types currently in the sliding window."""
     return {a["alert_type"] for a in get_window_alerts()}
 
 
 def _window_max_stage() -> int:
-    """
-    Return the highest kill-chain stage index already recorded in the
-    current alert window.  Used to escalate MITRE technique assignment
-    when the attacker has already been seen at an earlier stage.
-    """
     from temporal_fusion import MITRE_STAGE_ORDER
     stages = []
     for a in get_window_alerts():
@@ -300,98 +280,53 @@ def _window_max_stage() -> int:
 
 # ─────────────────────────────────────────────────────────────
 # DYNAMIC MITRE TECHNIQUE ASSIGNMENT
-#
-# Each detector now picks its MITRE technique based on two signals:
-#   1. threat_score  — how confident the model is
-#   2. window context — what stages have already been seen
-#
-# This lets the kill chain advance naturally as the attacker
-# progresses, instead of being frozen at the hardcoded stage.
-#
-# Kill-chain stage map (for reference):
-#   0 Recon | 1 Initial Access | 2 Execution | 3 Persistence
-#   4 Privilege Escalation | 5 Lateral Movement | 6 Collection
-#   7 Exfiltration/Impact
 # ─────────────────────────────────────────────────────────────
 
 def mitre_for_phishing(threat_score: float) -> str:
-    """
-    Phishing starts at Initial Access (stage 1).
-    High-confidence repeated phishing can indicate Execution-stage
-    credential harvesting (T1078 — Valid Accounts) when the attacker
-    has already achieved initial access.
-    """
-    seen_types  = _window_alert_types()
-    max_stage   = _window_max_stage()
-
+    max_stage = _window_max_stage()
     if max_stage >= 1 and threat_score >= 0.85:
-        # Attacker already inside; this phishing is now credential abuse
-        return "T1078"          # stage 2 — Execution / Valid Accounts
-    return "T1566.001"          # stage 1 — Initial Access / Spearphishing Attachment
+        return "T1078"
+    return "T1566.001"
 
 
 def mitre_for_url(threat_score: float) -> str:
-    """
-    Malicious URLs start at Initial Access (stage 1 — T1566.002).
-    A high-score URL after initial access has been established likely
-    represents a C2 callback or lateral movement link.
-    """
     max_stage = _window_max_stage()
-
     if max_stage >= 3 and threat_score >= 0.65:
-        return "T1021"          # stage 5 — Lateral Movement / Remote Services
+        return "T1021"
     if max_stage >= 2 and threat_score >= 0.65:
-        return "T1055"          # stage 3 — Persistence / Process Injection via URL
+        return "T1055"
     if max_stage >= 1 and threat_score >= 0.85:
-        return "T1059"          # stage 2 — Execution (drive-by / malicious link exec)
-    return "T1566.002"          # stage 1 — Initial Access / Spearphishing Link
+        return "T1059"
+    return "T1566.002"
 
 
 def mitre_for_prompt_injection(threat_score: float) -> str:
-    """
-    Prompt injection starts at Execution (stage 2 — T1059.PI).
-    A confirmed injection after the attacker has persisted can be
-    used for data Collection or Exfiltration.
-    """
     max_stage = _window_max_stage()
-
     if max_stage >= 4 and threat_score >= 0.65:
-        return "T1005"          # stage 6 — Collection / Data from Local System
+        return "T1005"
     if max_stage >= 3 and threat_score >= 0.65:
-        return "T1547"          # stage 3 — Persistence (AI system config backdoor)
-    return "T1059.PI"           # stage 2 — Execution / Prompt Injection
+        return "T1547"
+    return "T1059.PI"
 
 
 def mitre_for_deepfake_image(threat_score: float) -> str:
-    """
-    Image deepfakes start as Initial Access impersonation (T1656, stage 1).
-    High-confidence deepfakes seen after execution/persistence represent
-    active Privilege Escalation via identity fraud.
-    """
     max_stage = _window_max_stage()
-
     if max_stage >= 3 and threat_score >= 0.75:
-        return "T1548"          # stage 4 — Privilege Escalation / Abuse Elevation
+        return "T1548"
     if max_stage >= 2 and threat_score >= 0.65:
-        return "T1078"          # stage 2 — Execution / Valid Accounts (identity abuse)
-    return "T1656"              # stage 1 — Initial Access / Impersonation
+        return "T1078"
+    return "T1656"
 
 
 def mitre_for_deepfake_audio(threat_score: float) -> str:
-    """
-    Audio deepfakes start as Initial Access impersonation (T1656, stage 1).
-    A voice-clone after privilege escalation is likely being used for
-    social engineering to authorize data exfiltration or wire transfers.
-    """
     max_stage = _window_max_stage()
-
     if max_stage >= 5 and threat_score >= 0.75:
-        return "T1041"          # stage 7 — Exfiltration / Exfil over C2 Channel
+        return "T1041"
     if max_stage >= 4 and threat_score >= 0.65:
-        return "T1534"          # stage 5 — Lateral Movement / Internal Spearphishing
+        return "T1534"
     if max_stage >= 2 and threat_score >= 0.65:
-        return "T1548"          # stage 4 — Privilege Escalation (voice-auth bypass)
-    return "T1656"              # stage 1 — Initial Access / Impersonation
+        return "T1548"
+    return "T1656"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -420,7 +355,7 @@ def analyze_phishing(body: PhishingEmailInput):
     severity  = severity_from_score(phishing_combined)
 
     found_keywords = [kw for kw in PHISHING_KEYWORDS if kw.lower() in full_text.lower()]
-    explanation    = (
+    explanation = (
         f"Flagged as phishing ({phishing_combined * 100:.1f}% confidence). "
         + (f"Patterns found: {', '.join(repr(k) for k in found_keywords[:5])}. " if found_keywords else "")
         + "Do not click any links."
@@ -481,7 +416,7 @@ def analyze_url(body: TextInput):
     severity     = severity_from_score(threat_score)
 
     found_patterns = [p for p in URL_SUSPICIOUS_PATTERNS if p.lower() in body.text.lower()]
-    explanation    = (
+    explanation = (
         f"Domain '{domain}' classified malicious ({threat_score * 100:.1f}% confidence). "
         + (f"Suspicious patterns: {', '.join(repr(p) for p in found_patterns[:4])}. " if found_patterns else "")
         + "Do not visit this URL."
@@ -534,7 +469,6 @@ def analyze_prompt_injection(body: PromptInjectionInput):
         probs = torch.nn.functional.softmax(model(**inputs).logits, dim=-1)
 
     raw_probs = probs[0].tolist()
-    # label 0 = BENIGN, label 1 = INJECTION (per protectai model card)
     scores = {
         "injection":  round(raw_probs[1], 4),
         "legitimate": round(raw_probs[0], 4),
@@ -586,17 +520,11 @@ def analyze_prompt_injection(body: PromptInjectionInput):
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 4 — POST /analyze/deepfake  (IMAGE only)
+# ENDPOINT 4 — POST /analyze/deepfake  (IMAGE)
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze/deepfake")
 async def analyze_deepfake(file: UploadFile = File(...)):
-    """
-    Analyze a single IMAGE for deepfake detection.
-    Accepts: jpg, jpeg, png, webp, bmp
-    Model: prithivMLmods/Deep-Fake-Detector-v2-Model (ViT, 92% accuracy)
-    Labels: 'Realism' (authentic) | 'Deepfake' (manipulated)
-    """
     valid_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
     file_ext = os.path.splitext(file.filename or "")[-1].lower()
 
@@ -612,7 +540,7 @@ async def analyze_deepfake(file: UploadFile = File(...)):
     except Exception as e:
         return {"error": f"Cannot open image: {str(e)}", "filename": file.filename}
 
-    _get_deepfake()  # ensure model + SHAP explainer are loaded
+    _get_deepfake()
     deepfake_score, confidence, label = explain_deepfake_input(image)
 
     is_threat = label == "Deepfake"
@@ -669,18 +597,11 @@ async def analyze_deepfake(file: UploadFile = File(...)):
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT 4b — POST /analyze/deepfake-audio  (AUDIO only)
+# ENDPOINT 4b — POST /analyze/deepfake-audio  (AUDIO)
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/analyze/deepfake-audio")
 async def analyze_deepfake_audio(file: UploadFile = File(...)):
-    """
-    Analyze an AUDIO file for AI-generated / cloned speech detection.
-    Accepts : wav, mp3, flac, ogg, m4a
-    Model   : Gustking/wav2vec2-large-xlsr-deepfake-audio-classification
-    Labels  : 'Real' (authentic) | 'Fake' (AI-generated / voice-cloned)
-    Notes   : Audio is resampled to 16 kHz mono. Files >30 s are truncated.
-    """
     TARGET_SR = 16_000
     MAX_SECS  = 30
 
@@ -707,7 +628,7 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
     duration_secs = round(len(waveform) / TARGET_SR, 2)
 
     try:
-        _get_audio()  # ensure model + SHAP explainer are loaded
+        _get_audio()
         deepfake_score, confidence, label = explain_audio_input(waveform)
     except Exception as e:
         return {"error": f"Model inference failed: {str(e)}", "filename": file.filename}
@@ -718,7 +639,7 @@ async def analyze_deepfake_audio(file: UploadFile = File(...)):
 
     explanation = (
         f"Audio classified as AI-GENERATED / VOICE-CLONED ({deepfake_score * 100:.1f}% confidence). "
-        "Synthetic speech patterns detected — this audio may be a voice clone or TTS output."
+        "Synthetic speech patterns detected."
         if is_threat else
         f"Audio appears AUTHENTIC ({(1 - deepfake_score) * 100:.1f}% confidence). "
         "No synthetic speech indicators detected."
@@ -835,23 +756,20 @@ def health():
     )
     return {
         "status":  "ok",
-        "version": "4.3.0",
+        "version": "4.4.0",
         "models": {
             "phishing":         _PHISHING_MODEL_ID,
             "url":              _URL_MODEL_ID,
             "prompt_injection": _PROMPT_INJ_ID,
-            "deepfake_image":   _DEEPFAKE_IMAGE_ID + " (ViT, image-only)",
+            "deepfake_image":   _DEEPFAKE_IMAGE_ID,
             "deepfake_audio":   _DEEPFAKE_AUDIO_ID,
         },
         "shap": {
-            "method":                "KernelExplainer on output-probability space",
             "phishing_base_value":   round(_phishing_base_value, 4)   if _phishing_base_value   else None,
             "url_base_value":        round(_url_base_value, 4)         if _url_base_value         else None,
             "prompt_inj_base_value": round(_prompt_inj_base_value, 4) if _prompt_inj_base_value else None,
             "deepfake_base_value":   round(_deepfake_base_value, 4)   if _deepfake_base_value   else None,
             "audio_base_value":      round(_audio_base_value, 4)       if _audio_base_value       else None,
-            "background_size":       10,
-            "nsamples":              100,
         },
         "temporal_window": {
             "active_alerts":  len(get_window_alerts()),

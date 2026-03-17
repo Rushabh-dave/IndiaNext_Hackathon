@@ -1,10 +1,7 @@
-# AEGIS — Threat Detection Backend v4.4
-# Phase 1:  Phishing Email + Malicious URL Detection
-# Phase 2:  Temporal Fusion Layer + Real SHAP Explainability
-# Phase 3:  Groq AI Narrative Engine
-# Phase 4:  Prompt Injection + Image Deepfake Detection
-# Phase 4b: Audio Deepfake Detection (wav2vec2-large-xlsr)
-# Phase 4.4 Lazy / Background Model Loading (stdlib only — no new deps)
+# AEGIS — requirements.txt v4.4
+# NOTE: torch and torchaudio are installed by the Dockerfile directly
+#       (CPU-only build) — do NOT add them here or they will reinstall
+#       the full CUDA version and break the build.
 
 # ── API Framework ──────────────────────────────────────────────
 fastapi
@@ -16,15 +13,11 @@ python-dotenv
 pydantic
 pydantic[email]
 
-# ── Deep Learning ──────────────────────────────────────────────
-torch
-torchaudio
+# ── Transformers (models loaded from HuggingFace) ──────────────
 transformers
-peft
 
 # ── Explainability ─────────────────────────────────────────────
 shap
-transformers-interpret
 
 # ── AI Narrative Engine ────────────────────────────────────────
 groq
@@ -32,16 +25,13 @@ groq
 # ── Anthropic SDK ──────────────────────────────────────────────
 anthropic
 
-# ── Image Processing (Image Deepfake Detection) ────────────────
+# ── Image Processing ───────────────────────────────────────────
 pillow
-opencv-python
 
-# ── Audio Processing (Audio Deepfake Detection) ────────────────
+# ── Audio Processing ───────────────────────────────────────────
 librosa
 soundfile
 
 # ── Data & ML Utilities ────────────────────────────────────────
 numpy
-pandas
 scikit-learn
-scipy

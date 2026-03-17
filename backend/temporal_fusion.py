@@ -1,16 +1,13 @@
-# temporal_fusion.py (v4.3 - Full Merge, Lazy-Loaded)
+# temporal_fusion.py (v4.4 - Full, Deployment-Safe)
 # ─────────────────────────────────────────────────────────────
 # Combines:
 #   - v3.2: Prompt injection SHAP + tactic detection + Groq narrative
-#           Fixed temporal weights (peak_score=0.30, velocity=0.05)
 #   - v4.1: Image deepfake detection (ViT classifier)
-#   - v4.3: Audio deepfake detection (wav2vec2-large-xlsr)
+#   - v4.4: Audio deepfake (wav2vec2-base ~360MB, deployment-safe)
 #
 # All 5 explainers: phishing, url, prompt_injection, image deepfake, audio deepfake
 #
-# LAZY LOADING: Heavy deps (torch, transformers, shap, librosa, PIL)
-# are imported inside the functions that need them, NOT at module level.
-# This eliminates deployment timeout caused by eager model loading.
+# LAZY LOADING: Heavy deps imported inside functions only when called.
 # ─────────────────────────────────────────────────────────────
 
 import os
@@ -29,7 +26,6 @@ WINDOW_SECONDS       = 300
 MAX_ALERTS           = 50
 ESCALATION_THRESHOLD = 3
 
-# Groq client — lazy init to avoid import cost at startup
 _groq_client = None
 
 def _get_groq_client():
@@ -143,7 +139,7 @@ _AUDIO_BG_CLIPS  = 5
 
 
 # ─────────────────────────────────────────────────────────────
-# PREDICT FUNCTIONS  (import heavy deps only when called)
+# PREDICT FUNCTIONS
 # ─────────────────────────────────────────────────────────────
 
 def _make_phishing_predict(tokenizer, model):
@@ -228,12 +224,11 @@ def _make_audio_predict(model, extractor, target_sr: int = _AUDIO_TARGET_SR):
                 probs  = torch.softmax(logits[0], dim=0).tolist()
                 results.append([probs[0], probs[1]])
         return np.array(results, dtype=float)
-
     return predict
 
 
 # ─────────────────────────────────────────────────────────────
-# INIT FUNCTIONS  (lazy: each runs only on first call)
+# INIT FUNCTIONS
 # ─────────────────────────────────────────────────────────────
 
 def init_phishing_explainer(tokenizer, model):
@@ -336,7 +331,7 @@ def explain_phishing_input(text: str) -> dict:
         shap_legit  = float(sv[0]) if len(sv) > 0 else 0.0
         shap_threat = float(sv[1]) if len(sv) > 1 else 0.0
 
-        deviation        = prob_phishing - _phishing_base_value
+        deviation         = prob_phishing - _phishing_base_value
         bg_phishing_probs = bg_preds[:, 1]
         top_idx = np.argsort(np.abs(bg_phishing_probs - prob_phishing))[::-1][:3]
         top_contrasts = [
@@ -483,10 +478,6 @@ def explain_prompt_injection_input(text: str) -> dict:
 
 
 def explain_deepfake_input(image) -> Tuple[float, float, str]:
-    """
-    Run image deepfake detection on a single PIL image.
-    Returns: (deepfake_prob, confidence, label)
-    """
     if _deepfake_predict_fn is None or _deepfake_base_value is None:
         raise ValueError("Image deepfake explainer not initialized.")
     try:
@@ -501,10 +492,6 @@ def explain_deepfake_input(image) -> Tuple[float, float, str]:
 
 
 def explain_audio_input(waveform) -> Tuple[float, float, str]:
-    """
-    Run audio deepfake detection on a 16 kHz mono float32 numpy waveform.
-    Returns: (deepfake_prob, confidence, label)
-    """
     if _audio_predict_fn is None or _audio_base_value is None:
         raise ValueError("Audio deepfake explainer not initialized.")
     try:
@@ -519,7 +506,7 @@ def explain_audio_input(waveform) -> Tuple[float, float, str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# INJECTION TACTIC CLASSIFIER  (rule-based, zero latency)
+# INJECTION TACTIC CLASSIFIER
 # ─────────────────────────────────────────────────────────────
 
 _INJECTION_TACTIC_PATTERNS: List[tuple] = [
@@ -554,13 +541,6 @@ def _detect_injection_tactics(text: str) -> List[Dict[str, str]]:
 # GROQ NARRATIVE ENGINE
 # ─────────────────────────────────────────────────────────────
 
-def _threat_level(score: float) -> str:
-    if score >= 0.85:   return "CRITICAL - immediate danger"
-    elif score >= 0.65: return "HIGH - serious threat"
-    elif score >= 0.40: return "MEDIUM - concerning"
-    else:               return "LOW - monitor"
-
-
 def _build_threat_context(alert_types: list, timeline: list) -> str:
     blocks = []
 
@@ -571,8 +551,8 @@ def _build_threat_context(alert_types: list, timeline: list) -> str:
     audio_deepfake_details = [t for t in timeline if t.get("alert_type") == "audio_deepfake"]
 
     if phishing_details:
-        top   = max(phishing_details, key=lambda x: x["threat_score"])
-        shap  = top.get("shap_note", "")
+        top  = max(phishing_details, key=lambda x: x["threat_score"])
+        shap = top.get("shap_note", "")
         brand_hint = ""
         for brand in ["paypal", "amazon", "apple", "microsoft", "google", "bank",
                       "netflix", "facebook", "instagram", "linkedin", "dropbox", "docusign"]:
@@ -584,31 +564,20 @@ def _build_threat_context(alert_types: list, timeline: list) -> str:
             f"- Deceptive email designed to steal login credentials or install malware.\n"
             f"- Attacker goal: capture username/password for financial accounts or corporate systems.\n"
             f"- SHAP analysis: {shap if shap else 'High deviation from legitimate email baseline.'}\n"
-            f"- Specific risk: credential theft leading to unauthorized account access or financial fraud.\n"
             f"- Required actions: Do NOT click any links. Report to IT immediately.\n"
             f"  Reset passwords for any accounts mentioned in the email.\n"
-            f"  Enable multi-factor authentication (MFA) on all affected accounts.\n"
-            f"  Check if colleagues received the same email."
+            f"  Enable MFA on all affected accounts."
         )
 
     if url_details:
-        top   = max(url_details, key=lambda x: x["threat_score"])
-        shap  = top.get("shap_note", "")
-        domain_hint = ""
-        for kw in ["paypal", "amazon", "apple", "microsoft", "google", "bank",
-                   "login", "secure", "verify", "account", "update", "confirm"]:
-            if kw in shap.lower():
-                domain_hint = f" ('{kw}' pattern in URL)"
-                break
+        top  = max(url_details, key=lambda x: x["threat_score"])
+        shap = top.get("shap_note", "")
         blocks.append(
-            f"MALICIOUS URL DETECTED{domain_hint}:\n"
+            f"MALICIOUS URL DETECTED:\n"
             f"- Link leads to a fake login page, malware download, or scam site.\n"
-            f"- Attacker goal: capture credentials in real time or silently install malware.\n"
             f"- SHAP analysis: {shap if shap else 'URL structure deviates strongly from known-safe domains.'}\n"
-            f"- Specific risk: anyone who visits this URL may have their credentials stolen instantly.\n"
             f"- Required actions: Block this domain in your firewall immediately.\n"
-            f"  Warn all staff not to visit the URL. Check browser history across the team.\n"
-            f"  If anyone visited it: force-reset their passwords and scan that device for malware."
+            f"  Warn all staff. If anyone visited it: reset passwords and scan for malware."
         )
 
     if injection_details:
@@ -618,15 +587,9 @@ def _build_threat_context(alert_types: list, timeline: list) -> str:
         tactic_names = ", ".join(t["tactic"].replace("_", " ") for t in tactics) if tactics else "unknown tactic"
         blocks.append(
             f"PROMPT INJECTION ATTACK DETECTED:\n"
-            f"- Someone is injecting hidden instructions into your AI system to override its safety rules.\n"
             f"- Tactic used: {tactic_names}\n"
-            f"- Attacker goal: make the AI leak confidential data, bypass security filters, or act as a tool for the attacker.\n"
             f"- SHAP analysis: {shap if shap else 'Input deviates strongly from normal user queries.'}\n"
-            f"- Specific risk: AI features could be weaponized to expose internal system prompts or sensitive business data.\n"
-            f"- Required actions: Block this input — do NOT pass it to any AI model.\n"
-            f"  Log the source IP and user session immediately.\n"
-            f"  Audit recent AI interactions for signs of successful data extraction.\n"
-            f"  Add input validation and output filtering to all AI-powered endpoints."
+            f"- Required actions: Block this input. Log the source IP. Audit recent AI interactions."
         )
 
     if deepfake_details:
@@ -634,14 +597,9 @@ def _build_threat_context(alert_types: list, timeline: list) -> str:
         shap = top.get("shap_note", "")
         blocks.append(
             f"DEEPFAKE IMAGE DETECTED:\n"
-            f"- An AI-generated or manipulated face image was submitted — likely to impersonate a real person.\n"
-            f"- Attacker goal: bypass identity verification (KYC), commit account fraud, or spread disinformation.\n"
-            f"- SHAP analysis: {shap if shap else 'Visual features are inconsistent with authentic photographs.'}\n"
-            f"- Specific risk: if accepted, attacker gains access under a false identity enabling financial fraud or data theft.\n"
-            f"- Required actions: Reject and quarantine this image immediately.\n"
-            f"  Flag the submitting account for manual review — do not approve any pending requests from it.\n"
-            f"  Preserve the image as evidence and escalate to your fraud team.\n"
-            f"  Implement liveness detection or video verification in your identity pipeline."
+            f"- AI-generated or manipulated face image — likely to bypass identity verification.\n"
+            f"- SHAP analysis: {shap if shap else 'Visual features inconsistent with authentic photographs.'}\n"
+            f"- Required actions: Reject and quarantine image. Flag account for manual review."
         )
 
     if audio_deepfake_details:
@@ -649,55 +607,33 @@ def _build_threat_context(alert_types: list, timeline: list) -> str:
         shap = top.get("shap_note", "")
         blocks.append(
             f"DEEPFAKE AUDIO DETECTED:\n"
-            f"- An AI-generated or voice-cloned audio clip was submitted — likely impersonating a trusted person.\n"
-            f"- Attacker goal: bypass voice authentication, authorize fraudulent transactions, or conduct social engineering.\n"
-            f"- SHAP analysis: {shap if shap else 'Audio features deviate from authentic human speech patterns.'}\n"
-            f"- Specific risk: if trusted, attacker can impersonate executives or customers to authorize actions (e.g. wire transfers, account changes).\n"
-            f"- Required actions: Do NOT act on instructions from this audio clip.\n"
-            f"  Verify via a live callback to the claimed speaker using a known-good number.\n"
-            f"  Preserve the audio as forensic evidence and escalate to your fraud team.\n"
-            f"  Disable or add liveness checks to any voice-authenticated workflows."
+            f"- AI-generated or voice-cloned audio — likely impersonating a trusted person.\n"
+            f"- SHAP analysis: {shap if shap else 'Audio features deviate from authentic human speech.'}\n"
+            f"- Required actions: Do NOT act on this audio. Verify via live callback. Preserve as evidence."
         )
 
     for atype in alert_types:
         if atype not in ("phishing", "url", "prompt_injection", "deepfake", "audio_deepfake"):
-            blocks.append(
-                f"THREAT TYPE: {atype.upper()}\n"
-                f"- Suspicious activity detected. Review logs and investigate the source."
-            )
+            blocks.append(f"THREAT TYPE: {atype.upper()}\n- Suspicious activity. Review logs.")
 
     return "\n\n".join(blocks) if blocks else "Multiple threat signals detected — see timeline for details."
 
 
 def generate_narrative(analysis: dict) -> dict:
-    fused_score   = analysis.get("fused_score", 0)
-    severity      = analysis.get("severity", "UNKNOWN")
-    alert_count   = analysis.get("alert_count", 0)
-    kill_chain    = analysis.get("kill_chain", {})
-    tti           = analysis.get("time_to_impact", {})
-    features      = analysis.get("temporal_features", {})
-    timeline      = analysis.get("recent_timeline", [])
+    fused_score = analysis.get("fused_score", 0)
+    severity    = analysis.get("severity", "UNKNOWN")
+    alert_count = analysis.get("alert_count", 0)
+    kill_chain  = analysis.get("kill_chain", {})
+    tti         = analysis.get("time_to_impact", {})
+    features    = analysis.get("temporal_features", {})
+    timeline    = analysis.get("recent_timeline", [])
 
     current_stage = kill_chain.get("current_stage_name", "Unknown")
     next_stage    = kill_chain.get("predicted_next_name", "Unknown")
-    stages_done   = kill_chain.get("stages_traversed", [])
     eta_minutes   = tti.get("estimate_minutes")
     alert_types   = list(set(t["alert_type"] for t in timeline))
-
     threat_context = _build_threat_context(alert_types, timeline)
 
-    stage_descriptions = {
-        "Recon":                "gathering information about your organization",
-        "Initial Access":       "trying to break in via phishing or malicious links",
-        "Execution":            "trying to run malicious code on your systems",
-        "Persistence":          "trying to maintain hidden long-term access",
-        "Privilege Escalation": "trying to gain administrator-level control",
-        "Lateral Movement":     "trying to spread to other systems in your network",
-        "Collection":           "actively stealing data from your systems",
-        "Exfiltration/Impact":  "removing stolen data or causing direct damage",
-    }
-    current_stage_desc = stage_descriptions.get(current_stage, current_stage)
-    next_stage_desc    = stage_descriptions.get(next_stage, next_stage)
     threat_level = (
         "CRITICAL" if fused_score >= 0.85 else
         "HIGH"     if fused_score >= 0.65 else
@@ -708,34 +644,16 @@ def generate_narrative(analysis: dict) -> dict:
 
     prompt = (
         "You are a cybersecurity analyst explaining a SPECIFIC, ACTIVE threat to a business executive.\n"
-        "The executive is NOT technical. Use plain language. Name the exact threat. Give concrete steps.\n\n"
-        "ACTIVE THREAT SUMMARY\n"
-        "=====================\n"
-        f"Threat level  : {threat_level} ({fused_score:.0%} confidence)\n"
-        f"Severity      : {severity}\n"
-        f"Alerts        : {alert_count} detected\n"
-        f"Attack stage  : {current_stage} — {current_stage_desc}\n"
-        f"Next stage    : {next_stage} — {next_stage_desc}\n"
-        f"Time to next  : {time_window}\n"
-        f"Multi-vector  : {'YES — attacker using multiple attack methods simultaneously' if is_multi_vector else 'No — single attack type'}\n"
-        f"Escalating    : {'YES — severity increasing' if features.get('severity_trend', 0) > 0.5 else 'Stable'}\n\n"
-        "SPECIFIC THREAT DETAILS — use these exact details in your response:\n"
-        "=================================================================\n"
+        "Use plain language. Name the exact threat. Give concrete steps.\n\n"
+        f"Threat level: {threat_level} ({fused_score:.0%} confidence)\n"
+        f"Severity: {severity} | Alerts: {alert_count}\n"
+        f"Attack stage: {current_stage} → Next: {next_stage}\n"
+        f"Time to next stage: {time_window}\n"
+        f"Multi-vector: {'YES' if is_multi_vector else 'No'}\n\n"
+        "THREAT DETAILS:\n"
         f"{threat_context}\n\n"
-        "YOUR TASK\n"
-        "=========\n"
-        "1. Name the SPECIFIC attack (e.g. 'PayPal phishing', 'deepfake KYC fraud', 'AI prompt injection', 'voice-cloned CEO fraud')\n"
-        "   — NEVER say 'cyber attack' or 'suspicious activity' generically\n"
-        "2. Say in one sentence what the attacker is after (money, credentials, data, AI access)\n"
-        "3. Give 3 CONCRETE actions — not generic advice\n"
-        "   GOOD: 'Reset all PayPal-linked passwords immediately'\n"
-        "   GOOD: 'Block domain paypa1.com in your firewall right now'\n"
-        "   GOOD: 'Flag the KYC submission from account ID in question for manual fraud review'\n"
-        "   GOOD: 'Call the CFO back on their personal mobile to verify the wire transfer request'\n"
-        "   BAD:  'Monitor the situation' / 'Contact IT' / 'Stay vigilant'\n"
-        f"4. Scale urgency: CRITICAL = act in minutes, MEDIUM = act today\n\n"
         "Respond ONLY in this exact JSON (no markdown, no code fences):\n"
-        '{"defender_brief": "2-3 sentences. Name the specific attack. What attacker wants. What happens if we do not act in ' + time_window + '.","attacker_narrative": "2-3 sentences from attacker POV. What we sent/deployed. What we are trying to steal. Our next move.","risk_summary": "One sentence. Specific worst case — name the exact data/money/system at risk.","immediate_actions": ["specific action 1","specific action 2","specific action 3"]}'
+        '{"defender_brief":"2-3 sentences. Name the specific attack. What attacker wants. What happens if we do not act.","attacker_narrative":"2-3 sentences from attacker POV.","risk_summary":"One sentence. Specific worst case.","immediate_actions":["action 1","action 2","action 3"]}'
     )
 
     try:
@@ -762,9 +680,7 @@ def generate_narrative(analysis: dict) -> dict:
             "immediate_actions":  narrative.get("immediate_actions", []),
         }
     except json.JSONDecodeError as e:
-        return {"status": "json_parse_error", "error": str(e),
-                "raw_response": raw if "raw" in dir() else "no response",
-                "model_used": "fallback"}
+        return {"status": "json_parse_error", "error": str(e), "model_used": "fallback"}
     except Exception as e:
         return {"status": "error", "error": str(e), "model_used": "fallback"}
 
@@ -791,7 +707,7 @@ def push_alert(alert: AlertInput) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# TEMPORAL FEATURES  (weights from v3.2 — tested & fixed)
+# TEMPORAL FEATURES
 # ─────────────────────────────────────────────────────────────
 
 FEATURE_WEIGHTS = {
@@ -876,12 +792,12 @@ def detect_kill_chain_stage(alerts: List[dict]) -> dict:
     current   = stages[-1]
     predicted = min(current + 1, 7)
     return {
-        "current_stage_index":  current,
-        "current_stage_name":   MITRE_STAGE_NAMES[current],
-        "predicted_next_index": predicted,
-        "predicted_next_name":  MITRE_STAGE_NAMES[predicted],
-        "stage_path":           sorted(set(stages)),
-        "stages_traversed":     [MITRE_STAGE_NAMES[s] for s in sorted(set(stages))],
+        "current_stage_index":   current,
+        "current_stage_name":    MITRE_STAGE_NAMES[current],
+        "predicted_next_index":  predicted,
+        "predicted_next_name":   MITRE_STAGE_NAMES[predicted],
+        "stage_path":            sorted(set(stages)),
+        "stages_traversed":      [MITRE_STAGE_NAMES[s] for s in sorted(set(stages))],
         "highest_stage_reached": max(stages),
     }
 
