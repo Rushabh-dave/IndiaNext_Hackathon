@@ -15,26 +15,3 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
-```
-
-And full `requirements.txt`:
-```
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.0+cpu
-torchaudio==2.4.0+cpu
-numpy==1.26.4
-
-fastapi
-uvicorn[standard]
-python-multipart
-python-dotenv
-pydantic
-pydantic[email]
-transformers==4.40.0
-shap
-groq
-anthropic
-pillow
-librosa
-soundfile
-scikit-learn
