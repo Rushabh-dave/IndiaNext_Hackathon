@@ -1,5 +1,11 @@
 # 🛡️ PhishEye — AI-Powered Cyber Threat Detection Platform
 
+🏆 **Winner — IndiaNext Hackathon 2026**
+
+> Detect phishing, deepfakes, malicious URLs, and AI attacks — all in one platform.
+
+PhishEye is a real-time AI cybersecurity system that combines NLP, Computer Vision, and Audio Intelligence into a unified threat detection engine — built and validated under hackathon constraints.
+
 PhishEye is a full-stack cybersecurity intelligence platform built for the IndiaNext Hackathon. It uses state-of-the-art AI models to detect phishing emails, malicious URLs, prompt injection attacks, deepfake images, and AI-generated audio — all in real time from a single, premium web interface.
 
 ---
@@ -14,6 +20,12 @@ PhishEye is a full-stack cybersecurity intelligence platform built for the India
 
 > ⚠️ The backend runs on Render's free tier. The first request after 15 minutes of inactivity may take **30–60 seconds** to respond (cold start). Subsequent requests are fast.
 
+## 🎥 Demo Walkthrough
+
+https://your-demo-video-link
+
+> A quick 60–90 second demo showcasing real-time threat detection, dashboard insights, and multi-modal analysis.
+
 ---
 
 ## ✨ Features
@@ -25,6 +37,24 @@ PhishEye is a full-stack cybersecurity intelligence platform built for the India
 - **Deepfake Image Detection** — Uses a Vision Transformer (ViT) to detect AI-generated or manipulated faces
 - **Deepfake Audio Detection** — Detects AI-generated / voice-cloned audio using wav2vec2-base
 - **Video Scanner** *(Coming Soon)* — Placeholder for future video deepfake detection
+
+## 🧱 System Architecture Overview
+
+![Architecture](./assets/architecture.png)
+
+PhishEye follows a modular AI pipeline:
+
+- **Client Layer (React + Vite)** → handles user interaction and visualization  
+- **API Layer (FastAPI)** → routes requests to appropriate AI modules  
+- **AI Engine Layer**:
+  - NLP Models (Phishing, URL, Prompt Injection)
+  - Computer Vision (Deepfake Image)
+  - Audio Models (Deepfake Audio)
+- **Risk Scoring Engine** → aggregates outputs into a unified cyber risk score  
+- **Explainability Layer (SHAP)** → interprets model decisions  
+- **Temporal Fusion Engine** → detects multi-stage attack patterns  
+
+This architecture ensures scalability, modularity, and real-time performance.
 
 ### 📊 Intelligence Dashboard
 - Real-time **Cyber Risk Score** gauge (0–100) with animated SVG
@@ -58,6 +88,15 @@ PhishEye is a full-stack cybersecurity intelligence platform built for the India
 | **React Router v6** | SPA routing |
 | **Lucide React** | Icon library |
 | **Three.js / Canvas** | 3D shield hero + cyber grid backgrounds |
+
+## 🚀 What Makes PhishEye Unique?
+
+- 🧩 **Multi-Modal AI Detection** — Text, image, audio, and behavioral threat analysis in one system  
+- 🧠 **Explainable AI (XAI)** — SHAP-based interpretability for transparent decisions  
+- ⏱️ **Temporal Attack Intelligence** — Detects chained attacks across time windows  
+- 🎯 **MITRE ATT&CK Mapping** — Aligns threats with industry-standard frameworks  
+- ⚡ **Real-Time Processing** — Instant risk scoring and live dashboard updates  
+- 🎨 **Premium UX** — Interactive, animated cybersecurity dashboard with 3D elements  
 
 ### Backend
 | Technology | Purpose |
@@ -203,6 +242,14 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ---
 
+## 🌍 Real-World Use Cases
+
+- **Individuals** → Detect phishing emails, fake media, and malicious links  
+- **Enterprises** → Monitor and analyze cyber threats in real time  
+- **Security Analysts** → Gain explainable insights into attack patterns  
+- **AI Platforms** → Prevent prompt injection and adversarial inputs  
+- **Content Platforms** → Identify deepfake media before distribution  
+
 ## 🚢 Deployment
 
 ### Frontend → Vercel
@@ -220,6 +267,15 @@ VITE_API_BASE_URL=http://localhost:8000
 - Free tier spins down after 15 min of inactivity — first cold-start takes ~60s
 
 ---
+
+## 🔮 Future Scope
+
+- Browser extension for real-time phishing and URL detection  
+- Email client integration (Gmail, Outlook)  
+- Mobile application for on-the-go threat analysis  
+- Enterprise-grade API for security platforms  
+- Continuous model retraining with live threat intelligence  
+- Full video deepfake detection pipeline  
 
 ## 👥 Team
 
